@@ -197,9 +197,7 @@ def main():
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the results (trained neural network, consensus spaces...)")
     parser.add_argument("--reload", required=False, type=str,
-                        help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - "
-                             f"{bcolors.WARNING}NOTE{bcolors.ENDC}: Since FlexSIREN also learns a gray level adjustment, reload must be the path to a folder containing two additional "
-                             f"folders called: {bcolors.UNDERLINE}FlexSIREN{bcolors.ENDC} and {bcolors.UNDERLINE}volumeAdjustment{bcolors.ENDC})")
+                        help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)")
     args = parser.parse_args()
 
     # If NAME:path convention, split both
@@ -251,7 +249,7 @@ def main():
         optimizer = nnx.Optimizer(flexconsensus, optax.adam(1e-5))
         graphdef, state = nnx.split((flexconsensus, optimizer))
 
-        # Training loop (FlexSIREN)
+        # Training loop (FlexConsensus)
         print(f"{bcolors.OKCYAN}\n###### Training consensus... ######")
         for i in range(args.epochs):
             total_loss = 0
