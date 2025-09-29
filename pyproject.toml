@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hax"
+dynamic = ["version", "dependencies"]
+description = "Hax dependencies"
+requires-python = ">=3.10,<3.12"
+
+[project.scripts]
+project_manager = "hax.cli:main"
+
+[tool.setuptools]
+packages = ["hax"]
+
+[tool.setuptools.dynamic]
+version = {attr = "hax.__version__"}
+dependencies = {file = ["requirements.txt"]}
+
+[tool.uv.pip]
+extra-index-url = ["https://download.pytorch.org/whl/cpu", "https://download.pytorch.org/whl/cpu"]

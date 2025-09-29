@@ -1,0 +1,266 @@
+#!/usr/bin/env python
+
+
+import jax
+from jax import random as jnr, numpy as jnp
+from flax import nnx
+
+import random
+from functools import partial
+
+from hax.utils.miscellaneous import batched_knn
+from hax.utils.loggers import bcolors
+
+
+class Deconvolver(nnx.Module):
+    def __init__(self, lat_dim=10, n_layers=3, *, rngs: nnx.Rngs):
+        self.lat_dim = lat_dim
+        self.normal_key = rngs.distributions()
+
+        self.hidden_layers = [nnx.Linear(lat_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        for _ in range(n_layers):
+            self.hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers.append(nnx.Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
+        for _ in range(2):
+            self.hidden_layers.append(nnx.Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+        self.latent = nnx.Linear(256, lat_dim, rngs=rngs, kernel_init=jax.nn.initializers.uniform(0.0001))
+
+    def __call__(self, x):
+        aux = x
+        for layer in self.hidden_layers:
+            if layer.in_features != layer.out_features:
+                aux = nnx.relu(layer(aux))
+            else:
+                aux = nnx.relu(aux + layer(aux))
+        aux = self.latent(aux)
+        mean = x + aux
+
+        return mean
+
+
+@partial(jax.jit, static_argnames=["islog", "fraction", "subsetMode"])
+def train_deconv_step(graphdef, state, x, cov, z_space, islog=False, fraction=None, subsetMode="random"):
+    model, optimizer_deconv = nnx.merge(graphdef, state)
+
+    key = jnr.PRNGKey(random.randint(0, 2 ** 32 - 1))
+
+    def density_at(z, mean, cov, islog=False):
+        if islog:
+            lp = jax.scipy.stats.multivariate_normal.logpdf(z, mean, cov)
+            # return jax.scipy.special.logsumexp(lp, axis=0) - jnp.log(lp.shape[0])  # scalar
+        else:
+            lp = jax.scipy.stats.multivariate_normal.pdf(z, mean, cov)
+            # return jnp.mean(lp, axis=0)  # scalar
+        return lp
+
+    if islog:
+        reduced_kernel = lambda x, means, cov, in_log: jax.scipy.special.logsumexp(
+            jax.vmap(density_at, in_axes=(None, 0, 0, None))
+            (x, means, cov, in_log),
+            axis=0) - jnp.log(means.shape[0])
+    else:
+        reduced_kernel = lambda x, means, cov, in_log: jnp.mean(jax.vmap(density_at, in_axes=(None, 0, 0, None))
+                                                                (x, means, cov, in_log),
+                                                                axis=0)
+    density_at_vmap = jax.vmap(reduced_kernel, in_axes=(0, None, None, None))
+
+    def loss_fn(model, z, d_z, cov, kde_cov, z_space):
+        z_pp_space = jax.vmap(model)(z_space)
+
+        # Silverman factor
+        weights = jnp.full(z_space.shape[0], 1.0 / z_space.shape[0], dtype=z_space.dtype)
+        neff = 1. / jnp.sum(weights ** 2.)
+        factor = jnp.power(neff * (z_space.shape[1] + 2.) / 4.0, -1. / (z_space.shape[1] + 4.))
+
+        # Deconvolved landscape covariance
+        cov_true = jnp.atleast_2d(jnp.cov(z_pp_space.T, rowvar=True, bias=False, aweights=None))
+        cov_true = cov_true * factor ** 2.
+
+        # Fused covariances
+        cov_all = kde_cov[None, :, :] + cov
+
+        # Density (all)
+        d_zpp = density_at_vmap(z, z_pp_space, cov_all, islog)
+        if islog:
+            d_zpp = d_zpp - jax.scipy.special.logsumexp(d_zpp)
+        else:
+            d_zpp = d_zpp / d_zpp.sum()
+
+        # First order derivative regularization (smoothing)
+        # M, D = z_pp_space.shape
+        # inv_cov = jnp.linalg.inv(cov_true)
+        # sign, logdet = jnp.linalg.slogdet(cov_true)
+        # log_norm = 0.5 * (D * jnp.log(2.0 * jnp.pi) + logdet)
+        # diffs = z[:, None, :] - z_pp_space[None, :, :]
+        # exp_arg = jnp.einsum('ijd,dc,ijc->ij', diffs, inv_cov, diffs, precision=jax.lax.Precision.HIGH)
+        # K = jnp.exp(-0.5 * exp_arg - log_norm) / M
+        # K = K / K.sum()
+        # inv_diffs = jnp.einsum('dc,ijd->ijd', inv_cov, diffs, precision=jax.lax.Precision.HIGH)
+        # grads = -jnp.einsum('ij,ijd->id', K, inv_diffs, precision=jax.lax.Precision.HIGH)
+        # loss_first_order = jnp.mean(grads ** 2.)
+
+        # return jnp.square(d_zpp - d_z).mean() + 0.0001 * loss_first_order
+        return jnp.square(d_zpp - d_z).mean()
+
+    if fraction is None:
+        fraction = 1000
+    elif isinstance(fraction, float):
+        fraction = int(z_space.shape[0] * fraction)
+
+    if subsetMode == "random":
+        rnd_ids = jax.random.choice(key, jnp.arange(z_space.shape[0], dtype=jnp.int32),
+                                    shape=(min(fraction, z_space.shape[0]),), replace=False)
+    elif subsetMode == "random_nn":
+        rnd_ids, _ = batched_knn(z_space, x, k=1000, block_size=min(100000, z_space.shape[0]))
+        rnd_ids = rnd_ids.flatten()
+        # rnd_ids = jax.random.choice(key, nn_ids, shape=(min(fraction, len(nn_ids)),), replace=False)
+    else:
+        raise ValueError("Subset mode not implemented")
+    z_space = z_space[rnd_ids]
+    cov = cov[rnd_ids]
+
+    kde = jax.scipy.stats.gaussian_kde(z_space.T)
+
+    if islog:
+        d = kde.logpdf(x.T)
+        d = d - jax.scipy.special.logsumexp(d)
+    else:
+        d = kde.pdf(x.T)
+        d = d / d.sum()
+
+    grad_fn = nnx.value_and_grad(loss_fn, has_aux=False)
+    loss, grads = grad_fn(model, x, d, cov, kde.covariance, z_space)
+
+    optimizer_deconv.update(grads)
+
+    state = nnx.state((model, optimizer_deconv))
+
+    return loss, state
+
+
+
+def main():
+    import os
+    import sys
+    from tqdm import tqdm
+    import random
+    import numpy as np
+    from sklearn.decomposition import PCA
+    import argparse
+    import optax
+    from hax.checkpointer import NeuralNetworkCheckpointer
+    from hax.generators import NumpyGenerator
+    from hax.networks import train_deconv_step
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--latents", required=True, type=str,
+                        help="Path to the .npy file with the latent space to be deconvolved")
+    parser.add_argument("--covariances", required=True, type=str,
+                        help=f"Path to the .npy file with the covariances needed to estimate the deconvolution (output of {bcolors.UNDERLINE}estimate_latent_covariances{bcolors.ENDC} program)")
+    parser.add_argument("--lat_dim", required=False, type=int, default=3,
+                        help="Dimensionality of the latent space of the deconvolution network")
+    parser.add_argument("--mode", required=True, type=str, choices=["train", "predict"],
+                        help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
+                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the deconvolved latents from the input latents ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
+    parser.add_argument("--deconvolution_strength", required=False, type=float, default=1.0,
+                        help="Determines the deconvolution strength (set to 1.0 by default, meaning that the landscape will be deconvolved as expected from the computed covariances - larger values "
+                             "will yield a stronger deconvolution compared to the default value, while smaller values will be more conservative")
+    parser.add_argument("--epochs", required=False, type=int, default=100,
+                        help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 100 - "
+                             "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
+    parser.add_argument("--batch_size", required=False, type=int, default=1024,
+                        help = "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
+                               f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
+                               f"to monitor and/or measure memory usage and adjust this value")
+    parser.add_argument("--output_path", required=True, type=str,
+                        help="Path to save the results (trained neural network, deconvolved latents...)")
+    parser.add_argument("--reload", required=False, type=str,
+                        help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)")
+    args = parser.parse_args()
+
+    # Prepare data
+    latents = np.load(args.latents)
+    covariances = args.deconvolution_strength * np.load(args.covariances)
+
+    # Prepare network
+    rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
+    rng, model_key = jax.random.split(rng, 2)
+    deconvolver = Deconvolver(lat_dim=args.lat_dim, rngs=nnx.Rngs(model_key))
+
+    # Reload network
+    if args.reload is not None:
+        deconvolver = NeuralNetworkCheckpointer.load(deconvolver, os.path.join(args.reload, "deconvolver"))
+
+    # Train network
+    if args.mode == "train":
+
+        deconvolver.train()
+
+        # Remove covariances above or below std in PCA
+        cov_flat = covariances.reshape((covariances.shape[0], -1))
+        cov_pca = PCA(n_components=1).fit_transform(cov_flat)
+        cov_std = np.std(cov_pca)
+        idx = np.where(np.logical_and(cov_pca < cov_std, cov_pca > -cov_std))[0]
+        latents = latents[idx]
+        covariances = covariances[idx]
+
+        # Prepare data loader
+        data_loader = NumpyGenerator(latents).return_tf_dataset(shuffle=True, preShuffle=True,
+                                                                batch_size=args.batch_size, prefetch=20)
+
+        # Optimizers
+        optimizer = nnx.Optimizer(deconvolver, optax.adam(1e-6))
+        graphdef, state = nnx.split((deconvolver, optimizer))
+
+        # Training loop
+        print(f"{bcolors.OKCYAN}\n###### Training deconvolution... ######")
+        for i in range(args.epochs):
+            total_loss = 0
+
+            # For progress bar (TQDM)
+            step = 1
+            print(f'\nTraining epoch {i + 1}/{args.epochs} |')
+            pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=",
+                        colour="green")
+
+            for (x, _) in pbar:
+                loss, state = train_deconv_step(graphdef, state, x, covariances, latents, islog=True,
+                                                subsetMode="random", fraction=50000)
+                total_loss += loss
+
+                # Progress bar update  (TQDM)
+                pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+                step += 1
+        deconvolver, optimizer_deconv = nnx.merge(graphdef, state)
+
+        # Save model
+        NeuralNetworkCheckpointer.save(deconvolver, os.path.join(args.output_path, "deconvolver"))
+
+    elif args.mode == "predict":
+
+        deconvolver.eval()
+
+        # Prepare data loader
+        data_loader = NumpyGenerator(latents).return_tf_dataset(shuffle=False, preShuffle=False,
+                                                                batch_size=args.batch_size, prefetch=20)
+
+        # Jitted prediciton function
+        predict_fn = jax.jit(deconvolver.__call__)
+
+        # Predict loop
+        print(f"{bcolors.OKCYAN}\n###### Predicting deconvolved latents... ######")
+        latents_deconv = []
+        for i in range(args.epochs):
+            # For progress bar (TQDM)
+            pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=",
+                        colour="green")
+
+            for (x, labels) in pbar:
+                latents_deconv.append(predict_fn(x))
+        latents_deconv = np.asarray(latents_deconv)
+
+        # Save new latents
+        np.save(os.path.join(args.output_path, "latents_deconvolved.npy"), latents_deconv)
+
+if __name__ == "__main__":
+    main()

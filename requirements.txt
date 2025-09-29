@@ -1,0 +1,27 @@
+# We need a "high" cmake version (to be installed in conda env) if we want jaxkd[cuda]
+einops
+tqdm
+matplotlib
+numpy
+scikit-learn
+xmipp_metadata
+grain
+pandas
+jax[cuda12]<=0.6.0
+flax
+tensorflow
+tensorflow-datasets
+tfp-nightly[jax]
+jaxkd
+orbax
+cloudpickle
+dm_pix
+tensorboard
+umap
+pynndescent
+napari[all] >=0.6.0, < 0.7.0
+napari-molecule-reader
+python_tsp
+torch
+cuml-cu12==25.6.*
+umap-learn
