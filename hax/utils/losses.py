@@ -2,22 +2,10 @@ from functools import partial
 import jax
 from jax import numpy as jnp, lax as jlx
 from jax.scipy.special import logsumexp
-from flax import nnx
 import numpy as np
 import math
 import chex
 import dm_pix
-import random
-
-from ott.solvers.linear.univariate import uniform_solver
-from ott.geometry.distrib_costs import UnivariateWasserstein
-from ott.geometry.costs import EuclideanP, SqEuclidean
-
-from ott.geometry import costs, pointcloud
-from ott.problems.linear import linear_problem
-from ott.solvers.linear import univariate
-
-from hax.utils.fourier_filters import ctfFilter, rfft2_padded
 
 
 def gradient_loss(s, penalty='l2'):
