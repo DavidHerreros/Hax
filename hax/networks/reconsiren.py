@@ -317,7 +317,7 @@ class PhysDecoder:
             images = dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3)[..., 0]
 
         # Apply CTF
-        if ctf_type == "apply":
+        if ctf_type in ["apply", "wiener", "squared"]:
             ctf = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
             ctf = rearrange(ctf, "b n w h -> (b n) w h")
             images = ctfFilter(images, ctf, pad_factor=2)
@@ -449,14 +449,32 @@ def train_step_reconsiren(graphdef, state, x, labels, md):
         # Generate projections
         images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations, shifts, ctf, model.ctf_type)
 
-        # Consider CTF if Wiener mode (only for loss)
+        # Losses
+        images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
+        x_loss = x[..., 0] if x.shape[-1] == 1 else x
+
+        # Consider CTF if Wiener/Squared mode (only for loss)
         if model.ctf_type == "wiener":
-            x_corrected = wiener2DFilter(x[..., 0], ctf, pad_factor=2)[..., None]
-        else:
-            x_corrected = x
+            ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
+            ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
+
+            x_loss = wiener2DFilter(x_loss, ctf, pad_factor=2)
+
+            images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
+            images_corrected_loss = wiener2DFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
+            images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
+        elif model.ctf_type == "squared":
+            ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
+            ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
+
+            x_loss = ctfFilter(x_loss, ctf, pad_factor=2)
+
+            images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
+            images_corrected_loss = ctfFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
+            images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
 
         # Broadcast input images to right size
-        x_corrected = jnp.broadcast_to(x_corrected[:, None, ...], (x_corrected.shape[0], images_corrected.shape[1], x_corrected.shape[1], x_corrected.shape[2], 1))
+        x_loss = jnp.broadcast_to(x_loss[:, None, ...], (x_loss.shape[0], images_corrected.shape[1], x_loss.shape[1], x_loss.shape[2], 1))
 
         # Project "mask"
         if not model.delta_volume_decoder.transport_mass:
@@ -465,19 +483,15 @@ def train_step_reconsiren(graphdef, state, x, labels, md):
         else:
             projected_mask = jnp.ones_like(images_corrected)
 
-        # Losses
-        images_corrected = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
-        x_corrected = x_corrected[..., 0] if x_corrected.shape[-1] == 1 else x_corrected
-
         # Projection mask
         projected_mask = projected_mask[..., 0] if projected_mask.shape[-1] == 1 else projected_mask
-        x_corrected = x_corrected * projected_mask
-        images_corrected = images_corrected * projected_mask
+        x_loss = x_loss * projected_mask
+        images_corrected_loss = images_corrected_loss * projected_mask
 
-        x_flat = rearrange(x_corrected, "b n w h -> (b n) w h")
-        images_corrected_flat = rearrange(images_corrected, "b n w h -> (b n) w h")
+        x_flat = rearrange(x_loss, "b n w h -> (b n) w h")
+        images_corrected_flat = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
         recon_loss = dm_pix.mse(images_corrected_flat[..., None], x_flat[..., None])
-        recon_loss = rearrange(recon_loss, "(b n) -> b n", b=images_corrected.shape[0], n=images_corrected.shape[1])
+        recon_loss = rearrange(recon_loss, "(b n) -> b n", b=images_corrected_loss.shape[0], n=images_corrected_loss.shape[1])
 
         # Get minimum indices
         min_indices = jnp.argmin(recon_loss, axis=1)
@@ -626,14 +640,34 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md):
     # Generate projections
     images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations, shifts, ctf, model.ctf_type)
 
-    # Consider CTF if Wiener mode (only for loss)
+    # Losses
+    images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
+    x_loss = x[..., 0] if x.shape[-1] == 1 else x
+
+    # Consider CTF if Wiener/Squared mode (only for loss)
     if model.ctf_type == "wiener":
-        x_corrected = wiener2DFilter(x[..., 0], ctf, pad_factor=2)[..., None]
-    else:
-        x_corrected = x
+        ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :],
+                                           (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
+        ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
+
+        x_loss = wiener2DFilter(x_loss, ctf, pad_factor=2)
+
+        images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
+        images_corrected_loss = wiener2DFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
+        images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
+    elif model.ctf_type == "squared":
+        ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :],
+                                           (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
+        ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
+
+        x_loss = ctfFilter(x_loss, ctf, pad_factor=2)
+
+        images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
+        images_corrected_loss = ctfFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
+        images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
 
     # Broadcast input images to right size
-    x_corrected = jnp.broadcast_to(x_corrected[:, None, ...], (x_corrected.shape[0], images_corrected.shape[1], x_corrected.shape[1], x_corrected.shape[2], 1))
+    x_loss = jnp.broadcast_to(x_loss[:, None, ...], (x_loss.shape[0], images_corrected.shape[1], x_loss.shape[1], x_loss.shape[2], 1))
 
     # Project "mask"
     if not model.delta_volume_decoder.transport_mass:
@@ -642,19 +676,15 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md):
     else:
         projected_mask = jnp.ones_like(images_corrected)
 
-    # Losses
-    images_corrected = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
-    x_corrected = x_corrected[..., 0] if x_corrected.shape[-1] == 1 else x_corrected
-
     # Projection mask
     projected_mask = projected_mask[..., 0] if projected_mask.shape[-1] == 1 else projected_mask
-    x_corrected = x_corrected * projected_mask
-    images_corrected = images_corrected * projected_mask
+    x_loss = x_loss * projected_mask
+    images_corrected_loss = images_corrected_loss * projected_mask
 
-    x_flat = rearrange(x_corrected, "b n w h -> (b n) w h")
-    images_corrected_flat = rearrange(images_corrected, "b n w h -> (b n) w h")
+    x_flat = rearrange(x_loss, "b n w h -> (b n) w h")
+    images_corrected_flat = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
     recon_loss = dm_pix.mse(images_corrected_flat[..., None], x_flat[..., None])
-    recon_loss = rearrange(recon_loss, "(b n) -> b n", b=images_corrected.shape[0], n=images_corrected.shape[1])
+    recon_loss = rearrange(recon_loss, "(b n) -> b n", b=images_corrected_loss.shape[0], n=images_corrected_loss.shape[1])
 
     # Get minimum indices
     min_indices = jnp.argmin(recon_loss, axis=1)

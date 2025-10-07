@@ -296,7 +296,7 @@ class PhysDecoder:
             images = dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3)[..., 0]
 
         # Apply CTF
-        if ctf_type == "apply":
+        if ctf_type in ["apply" or "wiener" or "squared"]:
             images = ctfFilter(images, ctf, pad_factor=2)
 
         return images
@@ -453,17 +453,22 @@ def train_step_hetsiren(graphdef, state, x, labels, md):
 
         # Consider CTF if Wiener mode (only for loss)
         if model.ctf_type == "wiener":
-            x_corrected = wiener2DFilter(x, ctf, pad_factor=2)
+            x_loss = wiener2DFilter(x, ctf, pad_factor=2)
+            images_corrected_loss = wiener2DFilter(images_corrected, ctf, pad_factor=2)
+        elif model.ctf_type == "squared":
+            x_loss = ctfFilter(x, ctf, pad_factor=2)
+            images_corrected_loss = ctfFilter(images_corrected, ctf, pad_factor=2)
         else:
-            x_corrected = x
+            x_loss = x
+            images_corrected_loss = images_corrected
 
         # Projection mask
         projected_mask = jnp.squeeze(projected_mask)
-        x_corrected = x_corrected * projected_mask
-        images_corrected = images_corrected * projected_mask
+        x_loss = x_loss * projected_mask
+        images_corrected_loss = images_corrected_loss * projected_mask
 
-        # recon_loss = dm_pix.mae(images_corrected[..., None], x[..., None]).mean()
-        recon_loss = dm_pix.mse(images_corrected[..., None], x_corrected[..., None]).mean()
+        # recon_loss = dm_pix.mae(images_corrected_loss[..., None], x_loss[..., None]).mean()
+        recon_loss = dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
 
         # L1 based denoising
         if not model.delta_volume_decoder.transport_mass:
@@ -822,6 +827,19 @@ def main():
                     colour="green")
 
         for (x, labels) in pbar:
+
+            # Wiener filter if precorrect CTF mode
+            if args.ctf_type == "precorrect":
+                defocusU = md_columns["ctfDefocusU"][labels]
+                defocusV = md_columns["ctfDefocusV"][labels]
+                defocusAngle = md_columns["ctfDefocusAngle"][labels]
+                cs = md_columns["ctfSphericalAberration"][labels]
+                kv = md_columns["ctfVoltage"][labels][0]
+                ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                                 args.sr, [2 * hetsiren.xsize, int(2 * 0.5 * hetsiren.xsize + 1)],
+                                 x.shape[0], True)
+                x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+
             latents.append(predict_fn(x))
         latents = np.asarray(latents)
 
