@@ -51,7 +51,7 @@ class VolumeAdjustment(nnx.Module):
             return a, b
         else:
             values = a * self.values + b
-            values = nnx.relu(values)  # FIXME: Review this
+            # values = nnx.relu(values)  # FIXME: Review this
 
             return values
 
@@ -102,15 +102,20 @@ def train_step_volume_adjustment(graphdef, state, x, labels, md, sr, ctf_type, x
         # Gaussian filter (needed by forward interpolation)
         images = jnp.squeeze(dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3))
 
-        # Apply CTF
+        # Prepare data for losses
+        images = jnp.squeeze(images)
+        x = jnp.squeeze(x)
+
+        # Consider CTF
         if ctf_type == "apply":
             images = ctfFilter(images, ctf, pad_factor=2)
         elif ctf_type == "wiener":
-            images = wiener2DFilter(images, ctf, pad_factor=2)
+            x = wiener2DFilter(x, ctf, pad_factor=2)
+        elif ctf_type == "squared":
+            x = ctfFilter(x, ctf, pad_factor=2)
+            images = ctfFilter(images, ctf * ctf, pad_factor=2)
 
         # Loss
-        images = jnp.squeeze(images)
-        x = jnp.squeeze(x)
         loss = dm_pix.mse(images[..., None], x[..., None]).mean()
         return loss
 

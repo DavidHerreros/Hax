@@ -107,7 +107,8 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
         images = jnp.squeeze(dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3))
 
         # Apply gray level correction
-        images = (a * images + b) * (images != 0).astype(images.dtype)  # FIXME: Check this masking
+        # images = (a * images + b) * (images != 0).astype(images.dtype)  # FIXME: Check this masking
+        images = a * images + b
 
         # Prepare data for losses
         images = jnp.squeeze(images)
