@@ -405,6 +405,25 @@ class Zernike3Deep(nnx.Module):
         else:
             return images_corrected
 
+    def decode_volume(self, x):
+        if x.ndim == 1:
+            x = x[None, ...]
+
+        # Get deformation field
+        field = self.flow_decoder(x, self.inds, self.xsize)[0]
+
+        # Place values on grids
+        grids = jnp.zeros((x.shape[0], self.xsize, self.xsize, self.xsize))
+        for idx in range(x.shape[0]):
+            c_x = jnp.round(self.inds[..., 2] + field[idx, ..., 0]).astype(jnp.int32)
+            c_y = jnp.round(self.inds[..., 1] + field[idx, ..., 1]).astype(jnp.int32)
+            c_z = jnp.round(self.inds[..., 0] + field[idx, ..., 2]).astype(jnp.int32)
+            grids = grids.at[idx, c_z, c_y, c_x].add(self.values)
+
+        # Low pass filter
+        grids = jax.vmap(low_pass_3d)(grids)
+
+        return grids
 
 @jax.jit
 def train_step_zernike3deep(graphdef, state, x, labels, md):

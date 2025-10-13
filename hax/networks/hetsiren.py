@@ -410,6 +410,12 @@ class HetSIREN(nnx.Module):
         else:
             return images_corrected
 
+    def decode_volume(self, x):
+        if x.ndim == 1:
+            x = x[None, ...]
+
+        return self.delta_volume_decoder.decode_volume(self, x=x, filter=True)
+
 
 @jax.jit
 def train_step_hetsiren(graphdef, state, x, labels, md):

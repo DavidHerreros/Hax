@@ -13,6 +13,7 @@ MODULES_DICT = {
     "image_gray_scale_adjustment": ("hax.networks.image_gray_scale_adjustment", "Adjustment of volume projections to match a set of images"),
     "volume_gray_scale_adjustment": ("hax.networks.volume_gray_scale_adjustment", "Volume gray level adjustment towards a set of images"),
     "estimate_latent_covariances": ("hax.programs.estimate_latent_covariances", "Estimate latent space covariances matrices by simulating experimental images - needed by latent_space_deconvolution"),
+    "decode_states_from_latents": ("hax.programs.decode_states_from_latents", "Decode a set of volumes given a network (Zernike3D or HetSIREN) and a set of latent vectors"),
     "filter_latents": ("hax.programs.filter_latents", "Filtering of latent spaces based on z-scores"),
     "display_metrics": ("hax.metrics.writer", "Display the model metrics (training curves, validation curves...) extracted while training a neural network"),
     "annotate_space": ("hax.viewers.annotate_space.annotate_space", "Interactive latent space analysis with real time map generation")
