@@ -176,6 +176,33 @@ class JaxSummaryWriter(SummaryWriter):
                 global_step=idx
             )
 
+        # 10) Add text to explain colors in the visualizations
+        legend_mean = """
+        <h3>Consensus volume color legend</h3>
+        <ul>
+            <li>Consensus volume predicted by the network — White surface</li>
+        </ul>
+        """
+        legend_mad = """
+        <h3>Variation volume color legend</h3>
+        <ul>
+            <li>No structural variation — Blue surface</li>
+            <li>Some structural variation — White surface</li>
+            <li>Maximum structural variation — Red surface</li>
+        </ul>
+        """
+        legend_volume_series = """
+        <h3>Volume series color legend</h3>
+        <ul>
+            <li>Regions occupied only by the consensus — Blue surface</li>
+            <li>Regions occupied by consensus and state # — White surface</li>
+            <li>Regions occupied only by — Red surface</li>
+        </ul>
+        """
+        self.add_text("Consensus volume color legend", legend_mean)
+        self.add_text("Variation volume color legend", legend_mad)
+        self.add_text("Volume series color legend", legend_volume_series)
+
 
     def __getattribute__(self, name):
         # 1) Always let internal/private names through unwrapped:
