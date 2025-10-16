@@ -777,8 +777,7 @@ def main():
                         help="Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")
     parser.add_argument("--mode", required=True, type=str, choices=["train", "predict", "send_to_pickle"],
                         help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
-                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the latent vectors from the input images ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)\n"
-                             f"{bcolors.BOLD}send_to_pickle{bcolors.ENDC}: save the network in pickle format. ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case).")
+                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the latent vectors from the input images ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
     parser.add_argument("--epochs", required=False, type=int, default=50,
                         help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - "
                              "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
@@ -947,9 +946,9 @@ def main():
             ImageHandler().write(np.array(volume), os.path.join(args.output_path, "reconsiren_volume.mrc"))
 
         # Save model
-        NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"))
+        NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"), mode="pickle")
         if args.vol is not None:
-            NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"))
+            NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
     elif args.mode == "predict":  # TODO: Save angles here
 
@@ -968,7 +967,7 @@ def main():
         graphdef, state = nnx.split(reconsiren)
         md_pred = generator.md
         for (x, labels) in pbar:
-            rotations, shifts = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md)
+            rotations, shifts = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_pred)
 
             # Convert rotation to Euler angles in Xmipp format
             euler_angles = xmippEulerFromMatrix(rotations)
@@ -984,13 +983,6 @@ def main():
             md_pred[labels, 'shiftY'] = shifts[:, 1]
 
         md_pred.write(os.path.join(args.output_path, "predicted_latents.xmd"))
-
-    elif args.mode == "send_to_pickle":
-
-        # Save mode to pickle
-        NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"), mode="pickle")
-        if args.vol is not None:
-            NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
 if __name__ == "__main__":
     main()

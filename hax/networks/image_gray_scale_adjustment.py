@@ -267,7 +267,7 @@ def main():
         imageAdjustment, optimizer = nnx.merge(graphdef, state)
 
         # Save model
-        NeuralNetworkCheckpointer.save(imageAdjustment, os.path.join(args.output_path, "imageAdjustment"))
+        NeuralNetworkCheckpointer.save(imageAdjustment, os.path.join(args.output_path, "imageAdjustment"), mode="pickle")
 
     elif args.mode == "predict":
 
@@ -296,9 +296,9 @@ def main():
         output_images_path = os.path.join(args.output_path, "adjusted_images.mrcs")
         ImageHandler().write(imgs_adjusted, output_images_path, sr=args.sr)
         md = generator.md
-        for row in md:
+        for idx in range(len(md)):
             image_id, _ = md["image"].split('@')
-            md["image"] = "@".join([image_id, output_images_path])
+            md[idx, "image"] = "@".join([image_id, output_images_path])
         md.write(os.path.join(args.output_path, "adjusted_images.xmd"))
 
 if __name__ == "__main__":

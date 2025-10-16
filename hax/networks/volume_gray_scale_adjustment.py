@@ -257,7 +257,7 @@ def main():
         volumeAdjustment, optimizer = nnx.merge(graphdef, state)
 
         # Save model
-        NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"))
+        NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
     elif args.mode == "predict":
 

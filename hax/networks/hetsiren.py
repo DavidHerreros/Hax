@@ -637,9 +637,7 @@ def main():
                         help="Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")
     parser.add_argument("--mode", required=True, type=str, choices=["train", "predict", "send_to_pickle"],
                         help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
-                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the latent vectors from the input images ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)\n"
-                             f"{bcolors.BOLD}send_to_pickle{bcolors.ENDC}: save the network in pickle format. ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case - "
-                             f"needed by program {bcolors.UNDERLINE}estimate_latent_covariances{bcolors.ENDC})")
+                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the latent vectors from the input images ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
     parser.add_argument("--epochs", required=False, type=int, default=50,
                         help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - "
                              "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
@@ -811,9 +809,9 @@ def main():
         writer.add_images("Predicted images batch", x_pred_example, dataformats="NHWC")
 
         # Save model
-        NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN"))
+        NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN"), mode="pickle")
         if args.vol is not None:
-            NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"))
+            NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
     elif args.mode == "predict":
 
@@ -853,13 +851,6 @@ def main():
         md = generator.md
         md[:, 'latent_space'] = np.asarray([",".join(item) for item in latents.astype(str)])
         md.write(os.path.join(args.output_path, "predicted_latents.xmd"))
-
-    elif args.mode == "send_to_pickle":
-
-        # Save mode to pickle
-        NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN"), mode="pickle")
-        if args.vol is not None:
-            NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
 if __name__ == "__main__":
     main()

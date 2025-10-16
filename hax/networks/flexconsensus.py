@@ -184,9 +184,7 @@ def main():
                         help="Dimensionality of the latent space of the network (by default, it is set to the minimum dimension of all the provided input spaces)")
     parser.add_argument("--mode", required=True, type=str, choices=["train", "predict", "send_to_pickle"],
                         help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
-                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the latent vectors from the input images ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)\n"
-                             f"{bcolors.BOLD}send_to_pickle{bcolors.ENDC}: save the network in pickle format. ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case - "
-                             f"needed by program {bcolors.UNDERLINE}estimate_latent_covariances{bcolors.ENDC})")
+                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the latent vectors from the input images ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
     parser.add_argument("--epochs", required=False, type=int, default=100,
                         help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - "
                              "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
@@ -288,7 +286,7 @@ def main():
         flexconsensus, optimizer = nnx.merge(graphdef, state)
 
         # Save model
-        NeuralNetworkCheckpointer.save(flexconsensus, os.path.join(args.output_path, "FlexConsensus"))
+        NeuralNetworkCheckpointer.save(flexconsensus, os.path.join(args.output_path, "FlexConsensus"), mode="pickle")
 
     elif args.mode == "predict":
 
@@ -342,11 +340,6 @@ def main():
         for latent, input_file in zip(latents, args.input_spaces):
             output_file = os.path.join(args.output_path, str(Path(input_file).stem) + "_consensus.npy")
             np.save(output_file, latent)
-
-    elif args.mode == "send_to_pickle":
-
-        # Save mode to pickle
-        NeuralNetworkCheckpointer.save(flexconsensus, os.path.join(args.output_path, "FlexConsensus"), mode="pickle")
 
 if __name__ == "__main__":
     main()
