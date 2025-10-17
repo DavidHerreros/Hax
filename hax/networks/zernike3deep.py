@@ -736,10 +736,40 @@ def main():
 
                 # Summary writer (training loss)
                 if step % int(0.1 * len(data_loader)) == 0:
+                    zernike3deep_intermediate, _, _ = nnx.merge(graphdef, state)
+
                     writer.add_scalar('Training loss (Zernike3Deep)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
                 step += 1
+
+            # Log intermediate results at the end of the epoch
+            # Get first 5 images from batch
+            x_for_tb = x[:5]
+            labels_for_tb = labels[:5]
+
+            # Prepare images
+            if args.ctf_type == "precorrect":
+                defocusU = md_columns["ctfDefocusU"][labels_for_tb]
+                defocusV = md_columns["ctfDefocusV"][labels_for_tb]
+                defocusAngle = md_columns["ctfDefocusAngle"][labels_for_tb]
+                cs = md_columns["ctfSphericalAberration"][labels_for_tb]
+                kv = md_columns["ctfVoltage"][labels_for_tb][0]
+                ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                                 args.sr, [2 * zernike3deep_intermediate.xsize,
+                                           int(2 * 0.5 * zernike3deep_intermediate.xsize + 1)],
+                                 x_for_tb.shape[0], True)
+                x_for_tb = wiener2DFilter(jnp.squeeze(x_for_tb), ctf)[..., None]
+
+            # Decode some images and show them in Tensorboard
+            x_pred_intermediate, latents_intermediate = zernike3deep_intermediate.decode_image(x_for_tb, labels_for_tb, md_columns,
+                                                                                               ctf_type=args.ctf_type, return_latent=True)
+            x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
+            writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
+
+            # Decode some states and show them in Tensorboard
+            volumes_intermediate = zernike3deep_intermediate.decode_volume(latents_intermediate)
+            writer.add_volumes_slices(volumes_intermediate)
 
         zernike3deep, optimizer, optimizer_grays = nnx.merge(graphdef, state)
 

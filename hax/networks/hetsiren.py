@@ -414,7 +414,7 @@ class HetSIREN(nnx.Module):
         if x.ndim == 1:
             x = x[None, ...]
 
-        return self.delta_volume_decoder.decode_volume(self, x=x, filter=True)
+        return self.delta_volume_decoder.decode_volume(x=x, filter=True)
 
 
 @jax.jit
@@ -630,9 +630,9 @@ def main():
                              f'from the reference volume. This mask now tells the program which regions should be moved. Therefore, consider providing a mask that covers all the protein regions you would like '
                              f'to be analyzed by HetSIREN.')
     parser.add_argument("--local_reconstruction", action='store_true',
-                        help=f'When set, HetSIREN will turn to local heterogeneous reconstruction/refinement mod, focusing the analysis of heterogeneity to a region of interest enclosed by the provided refernece mask.'
-                             f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, TRANSPORT MASS WILL BE OVERRIDDEN AND NOT CONSIDERED.'
-                             f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, HAVING A REFERENCE VOLUME IS MANDATORY. OTHERWISE, THIS PARAMETER WILL BE NEGLECTED.')
+                        help=f'When set, HetSIREN will turn to local heterogeneous reconstruction/refinement mod, focusing the analysis of heterogeneity to a region of interest enclosed by the provided refernece mask. '
+                             f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, TRANSPORT MASS WILL BE OVERRIDDEN AND NOT CONSIDERED. '
+                             f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, HAVING A REFERENCE VOLUME IS MANDATORY. OTHERWISE, THIS PARAMETER WILL BE NEGLECTED. ')
     parser.add_argument("--ctf_type", required=True, type=str, choices=["None", "apply", "wiener", "precorrect"],
                         help="Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")
     parser.add_argument("--mode", required=True, type=str, choices=["train", "predict", "send_to_pickle"],
@@ -768,19 +768,18 @@ def main():
             grid = jnp.zeros_like(vol)
             grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
             hetsiren.reference_volume = grid
-            hetsiren.delta_volume_decoder.values = values
+            hetsiren.delta_volume_decoder.reference_values = values
 
         # Optimizers (HetSIREN)
         params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
-        params_grays = nnx.All(nnx.Param, nnx.PathContains('phys_decoder'))
         optimizer = nnx.Optimizer(hetsiren, optax.adam(1e-5), wrt=params)
-        optimizer_grays = nnx.Optimizer(hetsiren, optax.adam(1e-5), wrt=params_grays)
-        graphdef, state = nnx.split((hetsiren, optimizer, optimizer_grays))
+        graphdef, state = nnx.split((hetsiren, optimizer))
 
         # Training loop (HetSIREN)
         print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
         for i in range(args.epochs):
             total_loss = 0
+            total_recon_loss = 0
 
             # For progress bar (TQDM)
             step = 1
@@ -788,20 +787,55 @@ def main():
             pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
 
             for (x, labels) in pbar:
-                loss, state = train_step_hetsiren(graphdef, state, x, labels, md_columns)
+                loss, recon_loss, state = train_step_hetsiren(graphdef, state, x, labels, md_columns)
                 total_loss += loss
+                total_recon_loss += recon_loss
 
                 # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
 
                 # Summary writer (training loss)
                 if step % int(0.1 * len(data_loader)) == 0:
+                    hetsiren_intermediate, _ = nnx.merge(graphdef, state)
+
                     writer.add_scalar('Training loss (HetSIREN)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
+
+                    writer.add_scalar('Reconstruction loss (HetSIREN)',
+                                      total_recon_loss / step,
+                                      i * len(data_loader) + step)
                 step += 1
 
-        hetsiren, optimizer, optimizer_grays = nnx.merge(graphdef, state)
+            # Log intermediate results at the end of the epoch
+            # Get first 5 images from batch
+            x_for_tb = x[:5]
+            labels_for_tb = labels[:5]
+
+            # Prepare images
+            if args.ctf_type == "precorrect":
+                defocusU = md_columns["ctfDefocusU"][labels_for_tb]
+                defocusV = md_columns["ctfDefocusV"][labels_for_tb]
+                defocusAngle = md_columns["ctfDefocusAngle"][labels_for_tb]
+                cs = md_columns["ctfSphericalAberration"][labels_for_tb]
+                kv = md_columns["ctfVoltage"][labels_for_tb][0]
+                ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                                 args.sr,
+                                 [2 * hetsiren_intermediate.xsize, int(2 * 0.5 * hetsiren_intermediate.xsize + 1)],
+                                 x_for_tb.shape[0], True)
+                x_for_tb = wiener2DFilter(jnp.squeeze(x_for_tb), ctf)[..., None]
+
+            # Decode some images and show them in Tensorboard
+            x_pred_intermediate, latents_intermediate = hetsiren_intermediate.decode_image(x_for_tb, labels_for_tb, md_columns,
+                                                                                           ctf_type=args.ctf_type, return_latent=True)
+            x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
+            writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
+
+            # Decode some states and show them in Tensorboard
+            volumes_intermediate = hetsiren_intermediate.decode_volume(latents_intermediate)
+            writer.add_volumes_slices(volumes_intermediate)
+
+        hetsiren, optimizer = nnx.merge(graphdef, state)
 
         # Example of predicted data for Tensorboard
         x_pred_example = hetsiren.decode_image(x_example, labels_example, md_columns, ctf_type=None, return_latent=False)
