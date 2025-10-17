@@ -14,10 +14,11 @@ from xmipp_metadata.image_handler import ImageHandler
 from torch.utils.tensorboard import SummaryWriter
 
 import jax
+import jax.numpy as jnp
 from jax import device_get
 from jax.numpy import ndarray as JaxArray
 
-from hax.utils import bcolors
+from hax.utils import bcolors, min_max_scale, low_pass_3d
 
 
 class JaxSummaryWriter(SummaryWriter):
@@ -34,149 +35,71 @@ class JaxSummaryWriter(SummaryWriter):
         # Recursively map over lists/tuples/dicts
         return jax.tree_util.tree_map(self._to_numpy, tree)
 
-    def add_volumes(self, volumes, mode="structural"):
-        volumes_ori = self._to_numpy(volumes)
+    def add_volumes_slices(self, volumes):
+        @jax.jit
+        def prepare_slices(volumes):
+            # 0) From gray image to color
+            def gray_to_color(x):
+                x_flat = x.reshape(-1)
 
-        # 1) Resize volumes (size of 64 px for space and performance purposes)
-        volumes = []
-        for volume in volumes_ori:
-            volumes.append(ImageHandler().scaleSplines(inputFn=volume, finalDimension=64))
-        volumes = np.asarray(volumes)
+                # Robust normalization to [0, 1]; if x is constant, map to mid (0.5 → white)
+                x_min = jnp.min(x_flat)
+                x_max = jnp.max(x_flat)
+                denom = x_max - x_min
+                t = jnp.where(denom > 0, (x_flat - x_min) / denom, jnp.full_like(x_flat, 0.5))
 
-        # 2) Compute MAD and mean volume
-        volumes_mad = []
-        volumes_series = []
-        for vol in volumes:
-            volumes_series.append(ImageHandler().generateMask(inputFn=vol, boxsize=64))
-            volumes_mad.append(vol * volumes_series[-1])
-        volume_mad = median_abs_deviation(volumes_mad, axis=0)
-        volume_mean = volumes.mean(axis=0)
-        volumes_series = np.asarray(volumes_series)
+                # bwr: blue (0,0,1) -> white (1,1,1) over [0,t_limit], then white -> red (1,0,0) over (t_limit,t_max]
+                blue = jnp.array([0.0, 0.0, 1.0])
+                white = jnp.array([1.0, 1.0, 1.0])
+                red = jnp.array([1.0, 0.0, 0.0])
 
-        # 3) Create automatic mask and mask original volume
-        volume_mean_mask = ImageHandler().generateMask(inputFn=volume_mean, boxsize=64)
-        volume_mean = volume_mean * volume_mean_mask
-        volume_mad = volume_mad * volume_mean_mask
-        volume_mean = gaussian_filter(volume_mean, sigma=1.0)
-        volume_mad = gaussian_filter(volume_mad, sigma=1.0)
+                # Interp weights for each half
+                t_limit = 0.25
+                t_max = 1.0
+                t_lo = jnp.clip(t / t_limit, 0.0, t_max)  # [0,t_limit] segment
+                t_hi = jnp.clip((t - t_limit) / t_limit, 0.0, t_max)  # (t_limit,t_max] segment
 
-        # 4) Create triangulation
-        verts_mean, faces_mean, _, _ = measure.marching_cubes(volume_mean,
-                                                              level=0.8 * 0.5 * (volume_mean.max() + volume_mean.min()),
-                                                              spacing=(1, 1, 1))
-        verts_masks_b, faces_masks_b, color_masks_b = [], [], []
-        for volume in volumes_series:
-            if mode == "superpose":
-                # VERSION: Place two meshes in the same tile
-                verts_masks, faces_masks, _, _ = measure.marching_cubes(volume, level=0.001, spacing=(1, 1, 1))
-                colors_masks = np.tile(np.asarray((194., 0., 61.))[None, ...], (verts_masks.shape[0], 1))
-                colors_other = np.tile(np.asarray((61., 0., 194.))[None, ...], (verts_masks.shape[0], 1))
-                verts_masks_b.append(np.concatenate([verts_masks, verts_mean], axis=0))
-                faces_masks_b.append(np.concatenate([faces_masks, verts_masks.shape[0] + faces_mean], axis=0))
-                color_masks_b.append(np.concatenate([colors_masks, colors_other], axis=0))
-            elif mode == "structural":
-                # VERSION: Structural differences based on masks
-                volume = 2. * volume + volume_mean_mask
-                verts_masks, faces_masks, _, volume_values = measure.marching_cubes(volume, level=0.001, spacing=(1, 1, 1))
-                color_masks = np.zeros((verts_masks.shape[0], 3))
-                color_masks[volume_values == 1] = np.array((61., 0., 194.))
-                color_masks[volume_values == 2] = np.array((194., 0., 61.))
-                color_masks[volume_values == 3] = np.array((255., 255., 255.))
-                verts_masks_b.append(verts_masks)
-                faces_masks_b.append(faces_masks)
-                color_masks_b.append(color_masks)
-            else:
-                raise ValueError(f"Not valid value for mode. Valid values are "
-                                 f"{bcolors.UNDERLINE}{bcolors.BOLD}superpose{bcolors.ENDC} or "
-                                 f"{bcolors.UNDERLINE}{bcolors.BOLD}structural{bcolors.ENDC}")
+                # Colors for each segment
+                color_lo = (1.0 - t_lo[:, None]) * blue + t_lo[:, None] * white
+                color_hi = (1.0 - t_hi[:, None]) * white + t_hi[:, None] * red
 
-        # 5) Get colors for MAD volume
-        values_mad = volume_mad[verts_mean[..., 0].astype(int), verts_mean[..., 1].astype(int), verts_mean[..., 2].astype(int)]  # TODO: Check this (indexing is wrong and creates holes)
-        cmap = plt.get_cmap('bwr')
-        norm = plt.Normalize(vmin=values_mad.min(), vmax=values_mad.max())
-        normalized_values = norm(values_mad)
-        rgba_colors = cmap(normalized_values) * 255.
-        colors_mad = rgba_colors[:, :3]
+                # Piecewise select
+                color = jnp.where((t[:, None] <= t_limit), color_lo, color_hi)
 
-        # 6) Prepare vertices
-        verts_mean = ((verts_mean - 0.5 * volume_mean.shape[-1]) / volume_mean.shape[-1])
-        verts_mean = np.stack([verts_mean[..., 2], verts_mean[..., 1], verts_mean[..., 0]], axis=-1)
-        for idx in range(volumes_series.shape[0]):
-            verts_masks_b[idx] = ((verts_masks_b[idx] - 0.5 * volume_mean.shape[-1]) / volume_mean.shape[-1])
-            verts_masks_b[idx] = np.stack([verts_masks_b[idx][..., 2], verts_masks_b[idx][..., 1], verts_masks_b[idx][..., 0]], axis=-1)
+                return color.reshape(x.shape + (3,))
 
-        # 7) Batch dimension for TensorBoard Mesh: [B, N, 3] and [B, M, 3]
-        verts_mean_b = verts_mean[np.newaxis, ...].astype(np.float32)  # [1, V, 3]
-        faces_mean_b = faces_mean[np.newaxis, ...].astype(np.int32)  # [1, F, 3]
-        colors_mad_b = colors_mad[np.newaxis, ...].astype(np.float32)  # [1, V, 3]
-        for idx in range(volumes_series.shape[0]):
-            verts_masks_b[idx] = verts_masks_b[idx][np.newaxis, ...].astype(np.float32)  # [N, 1, V, 3]
-            faces_masks_b[idx] = faces_masks_b[idx][np.newaxis, ...].astype(np.int32)  # [N, 1, F, 3]
-            color_masks_b[idx] = color_masks_b[idx][np.newaxis, ...].astype(np.float32)  # [N, 1, V, 3]
+            # 1) Compute MAD and mean volume
+            volume_mad = volumes.std(axis=0)
+            volume_mean = volumes.mean(axis=0)
 
-        # 8) Create config fict to improve visualization of the mesh
-        config_dict = {
-            "camera": {
-                "cls": "PerspectiveCamera",
-                "fov": 90,
-                "aspect": 0.5,
-            },
-            "lights": [
-                # soft ambient fill
-                {"cls": "AmbientLight", "color": [1.0, 1.0, 1.0], "intensity": 0.6},
+            # 2) Filter volumes
+            volume_mad = low_pass_3d(volume_mad, std=1.)
+            volume_mean = low_pass_3d(volume_mean, std=1.)
 
-                # key light from top-right
-                {"cls": "DirectionalLight", "color": [1.0, 1.0, 1.0],
-                 "intensity": 0.8, "position": [0.8, 0.8, 1.0]},
+            # 3) Convert volumes to color
+            volume_mean_color = min_max_scale(volume_mean)[..., None]
+            volume_mad_color = gray_to_color(min_max_scale(volume_mad))
 
-                # secondary light from lower-left
-                {"cls": "DirectionalLight", "color": [1.0, 1.0, 1.0],
-                 "intensity": 0.5, "position": [-0.7, -0.6, 0.8]},
+            # 4) Extract central slices
+            central_slice = int(0.5 * volume_mean.shape[-1])
+            slices_mean = [volume_mean_color[central_slice, :, :, :], volume_mean_color[:, central_slice, :, :], volume_mean_color[:, :, central_slice, :]]  # (Z, Y, X)
+            slices_mad = [volume_mad_color[central_slice, :, :, :], volume_mad_color[:, central_slice, :, :], volume_mad_color[:, :, central_slice, :]]  # (Z, Y, X)
+            volumes = jnp.abs(volume_mean[None, ...] - volumes)
+            volumes = jax.vmap(low_pass_3d, in_axes=(0, None))(volumes, 1.)
+            volumes = jax.vmap(gray_to_color)(jax.vmap(min_max_scale)(volumes))
+            slices_series = [volumes[:, central_slice, :, :, :], volumes[:, :, central_slice, :, :], volumes[:, :, :, central_slice, :]]
+            return jnp.stack(slices_mean, axis=0), jnp.stack(slices_mad, axis=0), jnp.stack(slices_series, axis=1)
 
-                # subtle backlight (rim light)
-                {"cls": "DirectionalLight", "color": [1.0, 1.0, 1.0],
-                 "intensity": 0.9, "position": [0.0, 0.0, -1.0]}
-            ],
-            "material": {
-                "cls": "MeshPhongMaterial",
-                "vertexColors": False,  # use vertex grayscale or map color
-                "wireframe": False,
-                "shininess": 10,  # lower = matte (ChimeraX smooth)
-                "specular": [0.1, 0.1, 0.1],  # soft highlights
-                "transparent": True,
-                "opacity": 1.0,  # slightly translucent for realism
-            },
-        }
+        # 1) Prepare slices from volumes
+        slices_mean, slices_mad, slices_series = prepare_slices(volumes)
 
-        # 9) Write volumes to Tensorboard
-        self.add_mesh(
-            "Consensus volume",
-            vertices=verts_mean_b,
-            faces=faces_mean_b,
-            config_dict=config_dict,
-            global_step=0
-        )
+        # 2) Log images in Tensorboard
+        self.add_image("Consensus volume", slices_mean, dataformats="NHWC")
+        self.add_image("Variation volume", slices_mad, dataformats="NHWC")
+        for idx in range(len(slices_series)):
+            self.add_image(f"Volume series State {idx + 1:02d}", slices_series[idx], dataformats="NHWC")
 
-        self.add_mesh(
-            "Variation volume",
-            vertices=verts_mean_b,
-            faces=faces_mean_b,
-            colors=colors_mad_b,
-            config_dict=config_dict,
-            global_step=0
-        )
-
-        for idx in range(volumes_series.shape[0]):
-            self.add_mesh(
-                "Volume series",
-                vertices=verts_masks_b[idx],
-                faces=faces_masks_b[idx],
-                colors=color_masks_b[idx],
-                config_dict=config_dict,
-                global_step=idx
-            )
-
-        # 10) Add text to explain colors in the visualizations
+        # 3) Add text to explain colors in the visualizations
         legend_mean = """
         <h3>Consensus volume color legend</h3>
         <ul>
@@ -187,22 +110,19 @@ class JaxSummaryWriter(SummaryWriter):
         <h3>Variation volume color legend</h3>
         <ul>
             <li>No structural variation — Blue surface</li>
-            <li>Some structural variation — White surface</li>
-            <li>Maximum structural variation — Red surface</li>
+            <li>Structural variation — White (medium)/Red (maximum) surface</li>
         </ul>
         """
         legend_volume_series = """
         <h3>Volume series color legend</h3>
         <ul>
-            <li>Regions occupied only by the consensus — Blue surface</li>
-            <li>Regions occupied by consensus and state # — White surface</li>
-            <li>Regions occupied only by — Red surface</li>
+            <li>Regions structurally different to consensus volume — White/Red surface</li>
+            <li>Regions structurally similar to consensus volume — Blue surface</li>
         </ul>
         """
         self.add_text("Consensus volume color legend", legend_mean)
         self.add_text("Variation volume color legend", legend_mad)
-        self.add_text("Volume series color legend", legend_volume_series)
-
+        self.add_text("Volume series State # color legend", legend_volume_series)
 
     def __getattribute__(self, name):
         # 1) Always let internal/private names through unwrapped:
