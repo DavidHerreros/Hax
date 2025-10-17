@@ -84,20 +84,14 @@ class JaxSummaryWriter(SummaryWriter):
             central_slice = int(0.5 * volume_mean.shape[-1])
             slices_mean = [volume_mean_color[central_slice, :, :, :], volume_mean_color[:, central_slice, :, :], volume_mean_color[:, :, central_slice, :]]  # (Z, Y, X)
             slices_mad = [volume_mad_color[central_slice, :, :, :], volume_mad_color[:, central_slice, :, :], volume_mad_color[:, :, central_slice, :]]  # (Z, Y, X)
-            volumes = jnp.abs(volume_mean[None, ...] - volumes)
-            volumes = jax.vmap(low_pass_3d, in_axes=(0, None))(volumes, 1.)
-            volumes = jax.vmap(gray_to_color)(jax.vmap(min_max_scale)(volumes))
-            slices_series = [volumes[:, central_slice, :, :, :], volumes[:, :, central_slice, :, :], volumes[:, :, :, central_slice, :]]
-            return jnp.stack(slices_mean, axis=0), jnp.stack(slices_mad, axis=0), jnp.stack(slices_series, axis=1)
+            return jnp.stack(slices_mean, axis=0), jnp.stack(slices_mad, axis=0)
 
         # 1) Prepare slices from volumes
-        slices_mean, slices_mad, slices_series = prepare_slices(volumes)
+        slices_mean, slices_mad = prepare_slices(volumes)
 
         # 2) Log images in Tensorboard
         self.add_image("Consensus volume", slices_mean, dataformats="NHWC")
         self.add_image("Variation volume", slices_mad, dataformats="NHWC")
-        for idx in range(len(slices_series)):
-            self.add_image(f"Volume series State {idx + 1:02d}", slices_series[idx], dataformats="NHWC")
 
         # 3) Add text to explain colors in the visualizations
         legend_mean = """
@@ -113,16 +107,8 @@ class JaxSummaryWriter(SummaryWriter):
             <li>Structural variation — White (medium)/Red (maximum) surface</li>
         </ul>
         """
-        legend_volume_series = """
-        <h3>Volume series color legend</h3>
-        <ul>
-            <li>Regions structurally different to consensus volume — White/Red surface</li>
-            <li>Regions structurally similar to consensus volume — Blue surface</li>
-        </ul>
-        """
         self.add_text("Consensus volume color legend", legend_mean)
         self.add_text("Variation volume color legend", legend_mad)
-        self.add_text("Volume series State # color legend", legend_volume_series)
 
     def __getattribute__(self, name):
         # 1) Always let internal/private names through unwrapped:
