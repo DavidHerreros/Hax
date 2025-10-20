@@ -618,6 +618,10 @@ def main():
                         help=f"HetSIREN reconstruction mask (useful to focus the reconstruction/estimated landscape on a specific region of interest - the mask provided "
                              f"must be binary -  {bcolors.WARNING}NOTE{bcolors.ENDC}: since this is a reconstruction mask, it should be defined such that it covers the "
                              f"volume were the motions of interest are expected to happen)")
+    parser.add_argument("--load_images_to_ram", action='store_true',
+                        help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
+                             f"images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance "
+                             f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
     parser.add_argument("--sr", required=True, type=float,
                         help="Sampling rate of the images/volume")
     parser.add_argument("--lat_dim", required=False, type=int, default=8,
@@ -678,12 +682,20 @@ def main():
             volume_size = generator.md.getMetaDataImage(0).shape[0]
             mask = ImageHandler().createCircularMask(boxSize=volume_size, is3D=True)
 
+    # Data loading approach
+    if args.load_images_to_ram:
+        mmap = False
+        mmap_output_dir = None
+    else:
+        mmap = True
+        mmap_output_dir = os.path.join(args.output_path, "images_mmap")
+
     # Random keys
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     rng, model_key, choice_key = jax.random.split(rng, 3)
 
     # Prepare network (HetSIREN)
-    hetsiren = HetSIREN(args.lat_dim, vol, mask, generator.md.getMetaDataImage(0).shape[-1], args.sr,
+    hetsiren = HetSIREN(args.lat_dim, vol, mask, generator.md.getMetaDataImage(0).shape[0], args.sr,
                          ctf_type=args.ctf_type, decoupling=True, isVae=True, transport_mass=transport_mass,
                          local_reconstruction=local_reconstruction, bank_size=len(generator.md), rngs=nnx.Rngs(model_key, choice=choice_key))
 
@@ -716,7 +728,8 @@ def main():
         writer = JaxSummaryWriter(os.path.join(args.output_path, "HetSIREN_metrics"))
 
         # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True, prefetch=20)
+        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
+                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
 
         # Example of training data for Tensorboard
         x_example, labels_example = next(iter(data_loader))
@@ -852,7 +865,8 @@ def main():
         hetsiren.eval()
 
         # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False, prefetch=20)
+        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False,
+                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
 
         # Jitted prediciton function
         predict_fn = jax.jit(hetsiren.__call__)

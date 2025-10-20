@@ -174,6 +174,10 @@ def main():
                         help="Volume to be adjusted according to the images")
     parser.add_argument("--mask", required=False, type=str,
                         help="This helps focusing the adjustment on a region of interest (if not provided, a inscribed spherical mask will be used)")
+    parser.add_argument("--load_images_to_ram", action='store_true',
+                        help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
+                             f"images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance "
+                             f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
     parser.add_argument("--sr", required=True, type=float,
                         help="Sampling rate of the images/volume")
     parser.add_argument("--ctf_type", required=True, type=str, choices=["None", "apply", "wiener", "precorrect"],
@@ -206,6 +210,14 @@ def main():
     else:
         mask = ImageHandler().createCircularMask(boxSize=vol.shape[0], is3D=True)
 
+    # Data loading approach
+    if args.load_images_to_ram:
+        mmap = False
+        mmap_output_dir = None
+    else:
+        mmap = True
+        mmap_output_dir = os.path.join(args.output_path, "images_mmap")
+
     inds = np.asarray(np.where(mask > 0.0)).T
     values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
 
@@ -230,7 +242,8 @@ def main():
         # Prepare metadata
         generator = MetaDataGenerator(args.md)
         md_columns = extract_columns(generator.md)
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True, prefetch=20)
+        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
+                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
 
         # Optimizers
         optimizer = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))

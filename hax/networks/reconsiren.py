@@ -754,6 +754,10 @@ def main():
                         help=f"ReconSIREN reconstruction mask (the mask provided must be binary - "
                              f"{bcolors.WARNING}NOTE{bcolors.ENDC}: since this is a reconstruction mask, it should be defined such that it covers the "
                              f"volume were the motions of interest are expected to happen)")
+    parser.add_argument("--load_images_to_ram", action='store_true',
+                        help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
+                             f"images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance "
+                             f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
     parser.add_argument("--sr", required=True, type=float,
                         help="Sampling rate of the images/volume")
     parser.add_argument("--transport_mass", action='store_true',
@@ -807,6 +811,14 @@ def main():
     else:
         mask = ImageHandler().createCircularMask(boxSize=xsize, is3D=True)
 
+    # Data loading approach
+    if args.load_images_to_ram:
+        mmap = False
+        mmap_output_dir = None
+    else:
+        mmap = True
+        mmap_output_dir = os.path.join(args.output_path, "images_mmap")
+
     # Random keys
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     rng, model_key, choice_key = jax.random.split(rng, 3)
@@ -845,7 +857,8 @@ def main():
         writer = JaxSummaryWriter(os.path.join(args.output_path, "ReconSIREN_metrics"))
 
         # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True, prefetch=20)
+        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
+                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
 
         # Example of training data for Tensorboard
         x_example, labels_example = next(iter(data_loader))
@@ -955,7 +968,8 @@ def main():
         reconsiren.eval()
 
         # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False, prefetch=20)
+        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False,
+                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting angular assignment / shifts... ######")
