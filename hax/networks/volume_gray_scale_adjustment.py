@@ -216,7 +216,7 @@ def main():
         mmap_output_dir = None
     else:
         mmap = True
-        mmap_output_dir = os.path.join(args.output_path, "images_mmap")
+        mmap_output_dir = args.output_path
 
     inds = np.asarray(np.where(mask > 0.0)).T
     values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
