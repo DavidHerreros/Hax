@@ -38,7 +38,7 @@ class ArrayListGenerator:
     def __getitem__(self, idx):
         return [np_array[idx] for np_array in self.data]
 
-    def return_tf_dataset(self, preShuffle=False, shuffle=True, prefetch=5, batch_size=8):
+    def return_tf_dataset(self, preShuffle=False, shuffle=True, prefetch=-1, batch_size=8):
         import tensorflow_datasets as tfds
         import tensorflow as tf
         tf.config.set_visible_devices([], device_type='GPU')
@@ -49,4 +49,6 @@ class ArrayListGenerator:
             dataset = tf.data.Dataset.from_tensor_slices(((np_array, idx) for np_array in self.data))
             if shuffle:
                 dataset = dataset.shuffle(len(idx))
+            if prefetch == -1:
+                prefetch = tf.data.AUTOTUNE
             return tfds.as_numpy(dataset.batch(batch_size).prefetch(prefetch))
