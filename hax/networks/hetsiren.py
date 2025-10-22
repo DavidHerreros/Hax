@@ -105,10 +105,53 @@ class Encoder(nnx.Module):
                 latent = self.latent(x)
                 return latent
 
+class EncoderTomo(nnx.Module):
+    def __init__(self, input_dim, lat_dim=10, n_layers=3, isVae=False, *, rngs: nnx.Rngs):
+        self.input_dim = input_dim
+        self.isVae = isVae
+        self.normal_key = rngs.distributions()
+
+        self.hidden_layers = [Linear(self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        for _ in range(n_layers):
+            self.hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers.append(Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
+        for _ in range(2):
+            self.hidden_layers.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+        self.latent = Linear(256, lat_dim, rngs=rngs)
+
+        if isVae:
+            self.mean_x = Linear(256, lat_dim, rngs=rngs)
+            self.logstd_x = Linear(256, lat_dim, rngs=rngs)
+        else:
+            self.latent = Linear(256, lat_dim, rngs=rngs)
+
+    def sample_gaussian(self, mean, logstd):
+        return logstd * jnr.normal(self.normal_key, shape=mean.shape) + mean
+
+    def __call__(self, x, return_last=False):
+        for layer in self.hidden_layers:
+            x = nnx.relu(layer(x))
+
+        if return_last:
+            return x
+        else:
+            if self.isVae:
+                mean = self.mean_x(x)
+                logstd = self.logstd_x(x)
+                sample = self.sample_gaussian(mean, logstd)
+                return sample, mean, logstd
+            else:
+                latent = self.latent(x)
+                return latent
+
 class MultiEncoder(nnx.Module):
-    def __init__(self, input_dim, lat_dim=10, n_layers=3, isVae=False, architecture="convnn", *, rngs: nnx.Rngs):
-        self.encoders = {"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, architecture=architecture, rngs=rngs),
-                         "encoder_dec": Encoder(input_dim, lat_dim, n_layers=n_layers, architecture=architecture,rngs=rngs)}
+    def __init__(self, input_dim, lat_dim=10, n_layers=3, isVae=False, architecture="convnn", isTomoSIREN=False, *, rngs: nnx.Rngs):
+        if isTomoSIREN:
+            self.encoders = {"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, architecture=architecture, rngs=rngs),
+                             "encoder_dec": EncoderTomo(100, lat_dim, n_layers=n_layers, rngs=rngs)}
+        else:
+            self.encoders = {"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, architecture=architecture, rngs=rngs),
+                             "encoder_dec": Encoder(input_dim, lat_dim, n_layers=n_layers, architecture=architecture, rngs=rngs)}
         self.normal_key = rngs.distributions()
         self.isVae = isVae
         if isVae:
@@ -303,20 +346,22 @@ class PhysDecoder:
 
 class HetSIREN(nnx.Module):
     def __init__(self, lat_dim, reference_volume, reconstruction_mask, xsize, sr, bank_size=10000, ctf_type="apply",
-                 decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn", *, rngs: nnx.Rngs):
+                 decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
+                 isTomoSIREN=False, *, rngs: nnx.Rngs):
         super(HetSIREN, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
         self.sr = sr
-        self.decoupling = decoupling
+        self.decoupling = decoupling if not isTomoSIREN else False
         self.isVae = isVae
+        self.isTomoSIREN = isTomoSIREN
         self.local_reconstruction = local_reconstruction
         self.reference_volume = reference_volume
         self.reconstruction_mask = reconstruction_mask.astype(float)
         self.inds = jnp.asarray(jnp.where(reconstruction_mask > 0.0)).T
         reference_values = reference_volume[self.inds[..., 0], self.inds[..., 1], self.inds[..., 2]][None, ...]
-        self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, architecture=architecture, rngs=rngs) \
-            if decoupling else Encoder(self.xsize, lat_dim, isVae=isVae, architecture=architecture, rngs=rngs)
+        self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, architecture=architecture, isTomoSIREN=isTomoSIREN, rngs=rngs) \
+            if decoupling or isTomoSIREN else Encoder(self.xsize, lat_dim, isVae=isVae, architecture=architecture, rngs=rngs)
         self.delta_volume_decoder = DeltaVolumeDecoder(self.inds.shape[0], lat_dim, self.xsize, self.inds, reference_values, transport_mass=transport_mass, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize, transport_mass=transport_mass)
 
@@ -430,15 +475,23 @@ def train_step_hetsiren(graphdef, state, x, labels, md):
     distributions_key = jnr.PRNGKey(random.randint(0, 2 ** 32 - 1))
 
     def loss_fn(model, x):
+        # Check if Tomo mode
+        if model.isTomoSIREN:
+            (x, subtomogram_label) = x
+
         # Encode latent E(z)
         if model.isVae:
             if model.decoupling:
                 (sample, latent, logstd), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True)
+            elif model.isTomoSIREN:
+                (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
             else:
                 sample, latent, logstd = model.encoder(x)
         else:
             if model.decoupling:
                 latent, prev_layer_out = model.encoder(x, "encoder_exp", return_last=True)
+            elif model.isTomoSIREN:
+                (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
             else:
                 latent = model.encoder(x)
 
@@ -518,21 +571,25 @@ def train_step_hetsiren(graphdef, state, x, labels, md):
             kl_loss = 0.0
 
         # Decoupling
-        if model.decoupling:
-            images_random = model.phys_decoder(x, values, coords, model.xsize, rotations_random, shifts, ctf_random, model.ctf_type)
-            if model.isVae:
-                (_, latent_1, _), prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec",
-                                                                        return_last=True)
-                (_, latent_2, _) = model.encoder(images_random[..., None], "encoder_dec")
+        if model.decoupling or model.isTomoSIREN:
+            if model.isTomoSIREN:
+                if model.isVae:
+                    (_, latent_1, _), prev_layer_out_random = model.encoder(x[..., None], "encoder_exp", return_last=True)
+                    (_, latent_2, _) = model.encoder(x[..., None], "encoder_exp")
+                else:
+                    latent_1, prev_layer_out_random = model.encoder(x[..., None], "encoder_exp", return_last=True)
+                    latent_2 = model.encoder(x[..., None], "encoder_exp")
             else:
-                latent_1, prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec",
-                                                               return_last=True)
-                latent_2 = model.encoder(images_random[..., None], "encoder_dec")
+                images_random = model.phys_decoder(x, values, coords, model.xsize, rotations_random, shifts, ctf_random, model.ctf_type)
+                if model.isVae:
+                    (_, latent_1, _), prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec", return_last=True)
+                    (_, latent_2, _) = model.encoder(images_random[..., None], "encoder_dec")
+                else:
+                    latent_1, prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec", return_last=True)
+                    latent_2 = model.encoder(images_random[..., None], "encoder_dec")
             decoupling_loss = (jnp.mean(jnp.square(latent - latent_1), axis=-1).mean() +
                                jnp.mean(jnp.square(latent - latent_2), axis=-1).mean() +
                                jnp.mean(jnp.square(prev_layer_out - prev_layer_out_random), axis=-1).mean())
-            # decoupling_loss = (jnp.mean(jnp.square(latent - latent_1), axis=-1).mean() +
-            #                    jnp.mean(jnp.square(latent - latent_2), axis=-1).mean())
 
             random_indices = jnr.choice(model.choice_key, a=jnp.arange(model.bank_size), shape=(model.subset_size,),
                                         replace=False)
@@ -542,7 +599,6 @@ def train_step_hetsiren(graphdef, state, x, labels, md):
             dist_nn, _ = jax.lax.approx_min_k(dist, k=10, recall_target=0.95)
             dist_fn, _ = jax.lax.approx_max_k(dist, k=10, recall_target=0.95)
 
-            # decoupling_loss += 1.0 * contrastive_ce_loss(dist_nn, dist_fn, reduction="mean", temperature=0.001)
             decoupling_loss += 1.0 * triplet_loss(dist_nn, dist_fn, reduction="mean", margin=0.01)
 
         else:
@@ -550,6 +606,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md):
 
         loss = recon_loss + 0.0001 * kl_loss + 0.001 * decoupling_loss + l1_loss  + 0.1 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss
         return loss, (recon_loss, latent)
+
+    # Check if Tomo mode
+    if model.isTomoSIREN:
+        (x, subtomogram_label) = x
 
     # Precompute batch aligments
     euler_angles = md["euler_angles"][labels]
@@ -587,7 +647,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md):
         ctf_random = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (loss, (recon_loss, latent)), grads = grad_fn(model, x)
+    if model.isTomoSIREN:
+        (loss, (recon_loss, latent)), grads = grad_fn(model, (x, subtomogram_label))
+    else:
+        (loss, (recon_loss, latent)), grads = grad_fn(model, x)
 
     optimizer.update(grads)
 
@@ -677,6 +740,9 @@ def main():
     generator = MetaDataGenerator(args.md)
     md_columns = extract_columns(generator.md)
 
+    # Check if TomoSIREN is needed
+    isTomoSIREN = generator.mode == "tomo"
+
     # Preprocess volume (and mask)
     if args.vol is not None:
         vol = ImageHandler(args.vol).getData()
@@ -712,8 +778,9 @@ def main():
 
     # Prepare network (HetSIREN)
     hetsiren = HetSIREN(args.lat_dim, vol, mask, generator.md.getMetaDataImage(0).shape[0], args.sr,
-                         ctf_type=args.ctf_type, decoupling=True, isVae=True, transport_mass=transport_mass,
-                         local_reconstruction=local_reconstruction, bank_size=len(generator.md), rngs=nnx.Rngs(model_key, choice=choice_key))
+                        ctf_type=args.ctf_type, decoupling=True, isVae=True, transport_mass=transport_mass,
+                        local_reconstruction=local_reconstruction, bank_size=len(generator.md), isTomoSIREN=isTomoSIREN,
+                        rngs=nnx.Rngs(model_key, choice=choice_key))
 
     # Reload network
     if args.reload is not None:
@@ -748,7 +815,10 @@ def main():
                                                   mmap=mmap, mmap_output_dir=mmap_output_dir)
 
         # Example of training data for Tensorboard
-        x_example, labels_example = next(iter(data_loader))
+        if hetsiren.isTomoSIREN:
+            (x_example, _), labels_example = next(iter(data_loader))
+        else:
+            x_example, labels_example = next(iter(data_loader))
         x_example = jax.vmap(min_max_scale)(x_example)
         writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
@@ -775,6 +845,9 @@ def main():
                             colour="green")
 
                 for (x, labels) in pbar:
+                    if isinstance(x, tuple):
+                        x = x[0]
+
                     loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
                                                                args.ctf_type, vol.shape[0])
                     total_loss += loss
@@ -847,7 +920,10 @@ def main():
 
             # Log intermediate results at the end of the epoch
             # Get first 5 images from batch
-            x_for_tb = x[:5]
+            if hetsiren.isTomoSIREN:
+                x_for_tb = x[0][:5]
+            else:
+                x_for_tb = x[:5]
             labels_for_tb = labels[:5]
 
             # Decode some images and show them in Tensorboard
@@ -913,6 +989,8 @@ def main():
                     colour="green")
 
         for (x, labels) in pbar:
+            if isinstance(x, tuple):
+                x = x[0]
 
             # Wiener filter if precorrect CTF mode
             if args.ctf_type == "precorrect":
