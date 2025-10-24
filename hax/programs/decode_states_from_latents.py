@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
 
+import jax
+from flax import nnx
 from hax.utils import *
 
 
@@ -32,10 +34,21 @@ def main():
                          f"saved as {bcolors.ITALIC}.txt{bcolors.ENDC} or {bcolors.ITALIC}.npy{bcolors.ENDC}")
 
     # Reload neural network
-    network = NeuralNetworkCheckpointer.load(None, args.reload, mode="binary")
+    network = NeuralNetworkCheckpointer.load(None, args.reload, mode="pickle")
+
+    # Split network (faster JIT)
+    graphdef, state = nnx.split(network)
+
+    # Jit function to increase speed
+    @jax.jit
+    def decode_volume(graphdef, state, x):
+        model = nnx.merge(graphdef, state)
+        return model.decode_volume(x)
 
     # Decode and save the volumes
-    volumes = np.array(network.decode_volume(latents))
+    volumes = []
+    for latent in latents:
+        volumes.append(np.array(decode_volume(graphdef, state, latent)))
 
     # Save volumes to file
     for idx in range(latents.shape[0]):
