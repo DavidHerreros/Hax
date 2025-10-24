@@ -94,7 +94,6 @@ class MetaDataGenerator:
                 np.random.shuffle(file_idx)
 
             if mmap:
-                drop_reminder = True
                 images = self.load_images_to_mmap(mmap_output_dir=mmap_output_dir, images_order=None)
 
                 def _load_image(idx):
@@ -109,19 +108,18 @@ class MetaDataGenerator:
                 def map_fn(i):
                     if self.mode == "tomo":
                         (image, subtomo_labels, idx) = tf.numpy_function(_load_image, [i], (tf.float32, tf.float32, tf.int64))
-                        image.set_shape((batch_size,) + images[0][..., None].shape)
-                        idx.set_shape([batch_size,])
-                        subtomo_labels.set_shape([batch_size, 100])
+                        image.set_shape((None,) + images[0][..., None].shape)
+                        idx.set_shape([None,])
+                        subtomo_labels.set_shape([None, 100])
                         return (image, subtomo_labels), idx
                     else:
                         image, idx = tf.numpy_function(_load_image, [i], (tf.float32, tf.int64))
-                        image.set_shape((batch_size,) + images[0][..., None].shape)
-                        idx.set_shape([batch_size,])
+                        image.set_shape((None,) + images[0][..., None].shape)
+                        idx.set_shape([None,])
                         return image, idx
 
                 dataset = tf.data.Dataset.from_tensor_slices(file_idx)
             else:
-                drop_reminder = False
                 images = self.load_images_to_ram(images_order=file_idx)
 
                 if self.mode == "tomo":
@@ -136,7 +134,7 @@ class MetaDataGenerator:
             if prefetch == -1:
                 prefetch = tf.data.AUTOTUNE
 
-            dataset = dataset.batch(batch_size, drop_remainder=drop_reminder)
+            dataset = dataset.batch(batch_size)
 
             if mmap:
                 dataset = dataset.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE, deterministic=False)
@@ -153,10 +151,8 @@ class MetaDataGenerator:
             np.random.shuffle(file_idx)
 
         if mmap:
-            drop_last = True
             images = self.load_images_to_mmap(mmap_output_dir=mmap_output_dir, images_order=file_idx)
         else:
-            drop_last = False
             images = self.load_images_to_ram(images_order=file_idx)
 
         if self.mode == "tomo":
@@ -168,8 +164,7 @@ class MetaDataGenerator:
         def numpy_collate(batch):
             return tree_map(np.asarray, default_collate(batch))
 
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0, collate_fn=numpy_collate,
-                          drop_last=drop_last)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0, collate_fn=numpy_collate)
 
     def return_grain_dataset(self, preShuffle=False, shuffle=True, batch_size=8, mmap=True, mmap_output_dir=None):
         import grain
@@ -194,10 +189,8 @@ class MetaDataGenerator:
             np.random.shuffle(file_idx)
 
         if mmap:
-            drop_remainder = True
             images = self.load_images_to_mmap(mmap_output_dir=mmap_output_dir, images_order=file_idx)
         else:
-            drop_remainder = False
             images = self.load_images_to_ram(images_order=file_idx)
 
         if self.mode == "tomo":
@@ -209,7 +202,7 @@ class MetaDataGenerator:
         if shuffle:
             seed = random.randint(0, 2 ** 32 - 1)
             dataset = dataset.shuffle(seed=seed)
-        return dataset.to_iter_dataset().batch(batch_size, drop_remainder=drop_remainder)
+        return dataset.to_iter_dataset().batch(batch_size)
 
 def extract_columns(md, hasCTF=None, isTomo=None):
     hasCTF = md.isMetaDataLabel("ctfDefocusU") if hasCTF is None else hasCTF
