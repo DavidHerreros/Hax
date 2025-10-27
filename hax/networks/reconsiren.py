@@ -747,7 +747,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp metadata file with the images (+ alignments / CTF) to be analyzed")
+                        help="Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed")
     parser.add_argument("--vol", required=False, type=str,
                         help="If provided, the neural network will start from this volume when assigning the angles and shifts to the images.")
     parser.add_argument("--mask", required=False, type=str,
@@ -902,7 +902,7 @@ def main():
                     pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
                     # Summary writer (training loss)
-                    if step % int(0.1 * len(data_loader)) == 0:
+                    if step % int(np.ceil(0.1 * len(data_loader))) == 0:
                         writer.add_scalar('Training loss (volume adjustment)',
                                           total_loss / step,
                                           i * len(data_loader) + step)
@@ -946,7 +946,7 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
 
                 # Summary writer (training loss)
-                if step % int(0.1 * len(data_loader)) == 0:
+                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
                     writer.add_scalar('Training loss (ReconSIREN)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
@@ -1002,7 +1002,7 @@ def main():
             md_pred[labels, 'shiftX'] = shifts[:, 0]
             md_pred[labels, 'shiftY'] = shifts[:, 1]
 
-        md_pred.write(os.path.join(args.output_path, "predicted_latents.xmd"))
+        md_pred.write(os.path.join(args.output_path, "predicted_pose_shifts" +  + os.path.splitext(args.md)[1]))
 
 if __name__ == "__main__":
     main()

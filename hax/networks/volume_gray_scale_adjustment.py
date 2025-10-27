@@ -166,10 +166,11 @@ def main():
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.networks import train_step_volume_adjustment
+    from hax.metrics import JaxSummaryWriter
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=False, type=str,
-                        help="Xmipp metadata file with the images (+ alignments / CTF) to be analyzed")
+                        help="Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed")
     parser.add_argument("--vol", required=True, type=str,
                         help="Volume to be adjusted according to the images")
     parser.add_argument("--mask", required=False, type=str,
@@ -245,11 +246,19 @@ def main():
 
         volumeAdjustment.train()
 
+        # Prepare summary writer
+        writer = JaxSummaryWriter(os.path.join(args.output_path, "Volume_adjustment_metrics"))
+
         # Prepare metadata
         generator = MetaDataGenerator(args.md)
         md_columns = extract_columns(generator.md)
         data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
                                                   mmap=mmap, mmap_output_dir=mmap_output_dir)
+
+        # Example of training data for Tensorboard
+        x_example, labels_example = next(iter(data_loader))
+        x_example = jax.vmap(min_max_scale)(x_example)
+        writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
         # Optimizers
         optimizer = nnx.Optimizer(volumeAdjustment, optax.adam(args.learning_rate))
@@ -272,6 +281,13 @@ def main():
 
                 # Progress bar update  (TQDM)
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+
+                # Summary writer (training loss)
+                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
+                    writer.add_scalar('Training loss (volume adjustment)',
+                                      total_loss / step,
+                                      i * len(data_loader) + step)
+
                 step += 1
         volumeAdjustment, optimizer = nnx.merge(graphdef, state)
 

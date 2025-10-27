@@ -14,6 +14,46 @@ from hax.utils import *
 from hax.layers import siren_init_first, siren_init
 from hax.networks import ImageAdjustment
 
+
+def pairwise_distances(embeddings: jnp.ndarray, squared: bool = False) -> jnp.ndarray:
+    """
+    Compute the 2D matrix of pairwise (squared) Euclidean distances.
+
+    Args:
+        embeddings: array of shape (batch_size, embed_dim)
+        squared: if True, return squared distances; else return Euclidean distances.
+
+    Returns:
+        distances: array of shape (batch_size, batch_size)
+    """
+    # (batch_size, batch_size)
+    dot_product = embeddings @ embeddings.T
+
+    # (batch_size,)
+    square_norm = jnp.diag(dot_product)
+
+    # ||a - b||^2 = ||a||^2 - 2<a,b> + ||b||^2
+    distances = (
+        square_norm[:, None]
+        - 2.0 * dot_product
+        + square_norm[None, :]
+    )
+
+    # Clamp tiny negatives to zero from numerical errors
+    distances = jnp.maximum(distances, 0.0)
+
+    if not squared:
+        # Avoid inf gradient at 0 by adding tiny epsilon only where needed
+        mask = distances == 0.0
+        eps = jnp.array(1e-16, dtype=embeddings.dtype)
+        distances = distances + mask.astype(embeddings.dtype) * eps
+        distances = jnp.sqrt(distances)
+        # Put exact zeros back on the masked entries
+        distances = distances * (~mask).astype(embeddings.dtype)
+
+    return distances
+
+
 class Encoder(nnx.Module):
     def __init__(self, input_dim, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
@@ -45,7 +85,7 @@ class Decoder(nnx.Module):
                 x = nnx.relu(layer(x))
             else:
                 x = nnx.relu(x + layer(x))
-        out = self.hidden_layers[:-1]
+        out = self.hidden_layers[-1](x)
         return out
 
 
@@ -61,14 +101,14 @@ class FlexConsensus(nnx.Module):
         else:
             self.input_spaces_name = input_spaces_name
 
-        self.encoders = {input_space_name + "_encoder": Encoder(input_space_dim, rngs=rngs) for input_space_dim, input_space_name in zip(input_spaces_dim, input_spaces_name)}
-        self.decoders = {input_space_name + "_decoder": Decoder(lat_dim, input_space_dim, rngs=rngs) for input_space_dim, input_space_name in zip(input_spaces_dim, input_spaces_name)}
+        self.encoders = {input_space_name + "_encoder": Encoder(input_space_dim, rngs=rngs) for input_space_dim, input_space_name in zip(input_spaces_dim, self.input_spaces_name)}
+        self.decoders = {input_space_name + "_decoder": Decoder(lat_dim, input_space_dim, rngs=rngs) for input_space_dim, input_space_name in zip(input_spaces_dim, self.input_spaces_name)}
         self.consensus_space = nnx.Linear(1024, lat_dim, rngs=rngs)
 
     def __call__(self, x, space_name_encoder, space_name_decoder=None):
-        encoded = self.encoders[space_name_encoder](x)
+        encoded = self.encoders[space_name_encoder + "_encoder"](x)
         if space_name_decoder is not None:
-            decoded = self.decoders[space_name_decoder](encoded)
+            decoded = self.decoders[space_name_decoder + "_decoder"](encoded)
             return encoded, decoded
         else:
             return encoded
@@ -76,64 +116,67 @@ class FlexConsensus(nnx.Module):
 
 @jax.jit
 def train_step_flexconsensus(graphdef, state, x):
-    model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
-
-    # VMAP functions for ater
-    histogram_vmap = jax.vmap(lambda x: jnp.histogram(x, density=True, bins=20))
+    model, optimizer = nnx.merge(graphdef, state)
 
     # Save encoder and decoder losses
     encoder_losses = 0.0
     total_losses = 0.0
     decoder_losses = {input_space_name: 0.0 for input_space_name in model.input_spaces_name}
 
+    # VMAP functions for later
+    pairwise_distances_batch = jax.vmap(pairwise_distances)
+
     def loss_fn(model, x, input_space_idx):
+        x_jnp = jnp.array(x)
+
         # Encode space
-        consensus_spaces = [model.consensus_space(model.encoders[input_space_name + "_encoder"](x)) for input_space_name in model.input_spaces_name]
+        consensus_spaces = [model.consensus_space(model.encoders[input_space_name + "_encoder"](input_space)) for input_space, input_space_name in zip(x, model.input_spaces_name)]  # TODO: Can we find the matching better?
 
         # Decode spaces
-        decoded_spaces = [model.decoder[input_space_name + "_decoder"](consensus_spaces[input_space_idx]) for input_space_name in model.input_spaces_name]
+        decoded_spaces = [model.decoders[input_space_name + "_decoder"](consensus_spaces[input_space_idx]) for input_space_name in model.input_spaces_name]
 
         # Consensus loss (single space)
-        single_space_loss = 0.0
-        for consensus_space_1 in consensus_spaces:
-            for consensus_space_2 in consensus_spaces:
-                single_space_loss += jnp.mean(jnp.square(consensus_space_1 - consensus_space_2), axis=-1).mean()
+        diffs = x_jnp[:, None, :, :] - x_jnp[None, :, :, :]
+        feature_mse_loss = jnp.mean(diffs ** 2, axis=(2, 3))
 
-                distance_matrix_1 = jnp.sqrt(jnp.sum((consensus_space_1[:, :, None] - consensus_space_1[:, None, :]) ** 2, axis=-1))
-                distance_matrix_2 = jnp.sqrt(jnp.sum((consensus_space_2[:, :, None] - consensus_space_2[:, None, :]) ** 2, axis=-1))
-                distance_matrix_1 = (distance_matrix_1 - distance_matrix_1.mean(axis=(1, 2), keepdims=True)) / distance_matrix_1.std(axis=(1, 2), keepdims=True)
-                distance_matrix_2 = (distance_matrix_2 - distance_matrix_2.mean(axis=(1, 2), keepdims=True)) / distance_matrix_2.std(axis=(1, 2), keepdims=True)
+        # Distance matrix for Wasserstein distance
+        distance_matrices = pairwise_distances_batch(jnp.array(consensus_spaces))
+        mean = distance_matrices.mean(axis=(1, 2), keepdims=True)
+        std = distance_matrices.std(axis=(1, 2), keepdims=True) + 1e-12
+        distance_matrices = (distance_matrices - mean) / std
 
-                distance_histogram_1, _ = histogram_vmap(distance_matrix_1)
-                distance_histogram_2, _ = histogram_vmap(distance_matrix_2)
+        # Upper triangular indices
+        iu, ju = jnp.triu_indices(distance_matrices.shape[-1], k=1)
+        distances = distance_matrices[:, iu, ju]
+        distances_sorted = jnp.sort(distances, axis=1)
 
-                single_space_loss += jnp.sum(jnp.abs(jnp.cumsum(distance_histogram_1) - jnp.cumsum(distance_histogram_2)), axis=-1).mean()
+        # Wasserstein distance
+        wdiff = jnp.abs(distances_sorted[:, None, :] - distances_sorted[None, :, :])
+        wasserstein_loss = wdiff.mean(axis=-1)
+
+        # Combine losses
+        single_space_loss = feature_mse_loss.mean() + wasserstein_loss.mean()
 
         # Consensus loss (Shannon mapping)
         shannon_mapping_loss = 0.0
-        distances_consensus_space = jnp.sqrt(jnp.sum((consensus_spaces[input_space_idx][:, :, None] - consensus_spaces[input_space_idx][:, None, :]) ** 2, axis=-1))
-        for input_space in x:
-            distances_input_space = jnp.sqrt(jnp.sum((input_space[:, :, None] - input_space[:, None, :]) ** 2, axis=-1))
-            distances_input_space = jnp.where(distances_input_space < 1e-5, 1e-5, distances_input_space)  # To avoid zero division
-            triu_consensus_space = jnp.triu(distances_consensus_space) - jax.diag(distances_consensus_space)
-            triu_distances_input_space = jnp.triu(distances_input_space) - jax.diag(distances_input_space)
-            shannon_mapping_loss += ((jnp.where(triu_distances_input_space == 0, 0.0,
-                                                jnp.square(triu_distances_input_space - triu_distances_input_space) / triu_consensus_space)).sum(axis=(1, 2)) *
-                                     1. / triu_distances_input_space.sum(axis=(1, 2))).mean()
+        distances_consensus_space = pairwise_distances(consensus_spaces[input_space_idx])[None, ...]
+        distances_input_space = pairwise_distances_batch(x_jnp)
+        triu_consensus_space = jnp.triu(distances_consensus_space, k=1)
+        triu_distances_input_space = jnp.triu(distances_input_space, k=1)
+        denominator_without_zeros = jnp.where(triu_distances_input_space == 0, 1.0, triu_distances_input_space)
+        shannon_mapping_loss += (jnp.where(triu_distances_input_space == 0., 0.0, jnp.square(triu_distances_input_space - triu_consensus_space) / denominator_without_zeros).sum(axis=(1, 2))
+                                 * 1. / triu_distances_input_space.sum(axis=(1, 2))).mean()
 
         # Consensus loss (Center of mass)
         center_of_mass_loss = jnp.square(consensus_spaces[input_space_idx].mean(axis=0)).sum()
 
         # Decoder loss
-        representation_loss = 0.0
-        for input_space, decoded_space in zip(x, decoded_spaces):
-            representation_loss += jnp.mean(jnp.square(input_space - decoded_space), axis=-1).mean()
-        representation_loss /= len(x)
+        representation_loss = jnp.mean(jnp.square(x_jnp - jnp.array(decoded_spaces)), axis=-1).mean()
 
         # Compute total loss
         loss = single_space_loss + shannon_mapping_loss + center_of_mass_loss + representation_loss
 
-        return loss, single_space_loss + shannon_mapping_loss + center_of_mass_loss, representation_loss
+        return loss, (single_space_loss + shannon_mapping_loss + center_of_mass_loss, representation_loss)
 
     for input_space_idx in range(len(model.input_spaces_name)):
         grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
@@ -149,7 +192,7 @@ def train_step_flexconsensus(graphdef, state, x):
     encoder_losses /= len(x)
     total_losses /= len(x)
 
-    state = nnx.state((model, optimizer, optimizer_grays))
+    state = nnx.state((model, optimizer))
 
     return total_losses, encoder_losses, decoder_losses, state
 
@@ -158,7 +201,6 @@ def train_step_flexconsensus(graphdef, state, x):
 
 def main():
     import os
-    from pathlib import Path
     import sys
     from tqdm import tqdm
     import random
@@ -216,8 +258,20 @@ def main():
         input_space = args.input_space
         input_spaces_name = None
 
+    # Get reading function for each file
+    reading_fns = []
+    for file in input_space:
+        if os.path.splitext(file)[-1] == ".npy":
+            reading_fns.append(np.load)
+        elif os.path.splitext(file)[-1] == ".txt":
+            reading_fns.append(np.loadtxt)
+        else:
+            raise ValueError(f"One of the filed you provided has a non supported extension. Please, provide either a "
+                             f"file with {bcolors.ITALIC}.npy{bcolors.ENDC} or {bcolors.ITALIC}.txt{bcolors.ENDC} extension.")
+
     # Read input spaces
-    input_spaces = [np.load(file) for file in input_space]
+    input_spaces = [reading_fn(file) for file, reading_fn in zip(input_space, reading_fns)]
+    input_spaces_dim = [input_space.shape[-1] for input_space in input_spaces]
 
     # Get latent dimensions
     if args.lat_dim is None:
@@ -232,7 +286,7 @@ def main():
     rng, model_key = jax.random.split(rng, 2)
 
     # Prepare network (FlexConsensus)
-    flexconsensus = FlexConsensus(input_spaces[0].shape[0], input_spaces_name, lat_dim, rngs=rng)
+    flexconsensus = FlexConsensus(input_spaces_dim, input_spaces_name, lat_dim, rngs=nnx.Rngs(model_key))
 
     # Reload network
     if args.reload is not None:
@@ -247,7 +301,7 @@ def main():
         writer = JaxSummaryWriter(os.path.join(args.output_path, "FlexConsensus_metrics"))
 
         # Prepare data loader
-        data_loader = ArrayListGenerator(input_spaces).return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True, prefetch=20)
+        data_loader = ArrayListGenerator(input_spaces).return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True)
 
         # Optimizers (FlexConsensus)
         optimizer = nnx.Optimizer(flexconsensus, optax.adam(args.learning_rate))
@@ -272,18 +326,18 @@ def main():
                 total_decoder_loss = {i: total_decoder_loss.get(i, 0) + decoder_loss.get(i, 0) for i in set(total_decoder_loss).union(decoder_loss)}
 
                 # Progress bar update  (TQDM)
-                loss_str_decoder_loss = " | ".join([f'{key}_deocder={value:.5f}' for key, value in total_decoder_loss.items()])
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | encoder_loss={encoder_loss / step:.5f} | decoder_loss={decoder_loss / step:.5f} | " + loss_str_decoder_loss)
+                loss_str_decoder_loss = " | ".join([f'{key}_decoder={value / step:.5f}' for key, value in total_decoder_loss.items()])
+                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | encoder_loss={encoder_loss / step:.5f} | " + loss_str_decoder_loss)
 
                 # Summary writer (training loss)
-                if step % int(0.1 * len(data_loader)) == 0:
+                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
                     writer.add_scalar('Training loss (FlexConsensus)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
                     writer.add_scalar('Encoder loss (FlexConsensus)',
                                       encoder_loss / step,
                                       i * len(data_loader) + step)
-                    for key, value in total_encoder_loss.items():
+                    for key, value in total_decoder_loss.items():
                         writer.add_scalar(f'Decoder loss ({key})',
                                           value / step,
                                           i * len(data_loader) + step)
@@ -299,7 +353,7 @@ def main():
         flexconsensus.train()
 
         # Jitted prediction function
-        predict_fn = jax.jit(flexconsensus.__call__)
+        predict_fn = jax.jit(flexconsensus.__call__, static_argnums=[1, 2])
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting consensus latents... ######")
@@ -308,7 +362,7 @@ def main():
             print(f"Predicting input space {idx + 1}/{len(input_spaces)}")
 
             # Prepare data loader
-            data_loader = NumpyGenerator(input_spaces[idx]).return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False, prefetch=20)
+            data_loader = NumpyGenerator(input_spaces[idx]).return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False)
 
             if input_spaces_name is not None and input_spaces_name[idx] in flexconsensus.input_spaces_name:
                 print(f"Valid identifier {input_spaces_name[idx]} provided for this input")
@@ -317,7 +371,7 @@ def main():
                 pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
 
                 for (x, _) in pbar:
-                    consensus_latents.append(predict_fn(x, space_name_encoder=input_spaces_name[idx]))
+                    consensus_latents.append(predict_fn(x, input_spaces_name[idx]))
             else:
                 print(f"Matching and detecting best possible prediction (due to missing or not valid identifier)")
                 representation_error = jnp.inf
@@ -331,7 +385,7 @@ def main():
                     pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
 
                     for (x, _) in pbar:
-                        encoded, decoded = predict_fn(x, space_name_encoder=input_space_name, space_name_decoder=input_space_name)
+                        encoded, decoded = predict_fn(x, input_space_name, input_space_name)
                         consensus_latents_trial.append(encoded)
                         representation_error_trial += jnp.mean(jnp.square(x - decoded), axis=-1).mean()
 
@@ -340,11 +394,11 @@ def main():
                     if representation_error_trial < representation_error:
                         consensus_latents = consensus_latents_trial
 
-            latents.append(np.array(consensus_latents))
+            latents.append(np.array(jnp.concatenate(consensus_latents, axis=0)))
 
         # Save consensus latents
-        for latent, input_file in zip(latents, args.input_spaces):
-            output_file = os.path.join(args.output_path, str(Path(input_file).stem) + "_consensus.npy")
+        for latent, input_space_name in zip(latents, input_spaces_name):
+            output_file = os.path.join(args.output_path, input_space_name + "_consensus.npy")
             np.save(output_file, latent)
 
 if __name__ == "__main__":

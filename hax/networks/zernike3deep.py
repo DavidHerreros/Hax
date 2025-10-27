@@ -592,7 +592,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp metadata file with the images (+ alignments / CTF) to be analyzed")
+                        help="Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed")
     parser.add_argument("--vol", required=True, type=str,
                         help="Volume to be warped toward the images")
     parser.add_argument("--mask", required=False, type=str,
@@ -745,7 +745,7 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
                 # Summary writer (training loss)
-                if step % int(0.1 * len(data_loader)) == 0:
+                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
                     writer.add_scalar('Training loss (volume adjustment)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
@@ -793,7 +793,7 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
                 # Summary writer (training loss)
-                if step % int(0.1 * len(data_loader)) == 0:
+                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
                     zernike3deep_intermediate, _, _ = nnx.merge(graphdef, state)
 
                     writer.add_scalar('Training loss (Zernike3Deep)',
@@ -896,7 +896,7 @@ def main():
         # Save latents in metadata
         md = generator.md
         md[:, 'latent_space'] = np.asarray([",".join(np.char.mod('%f', item)) for item in latents])
-        md.write(os.path.join(args.output_path, "predicted_latents.xmd"))
+        md.write(os.path.join(args.output_path, "predicted_latents" +  os.path.splitext(args.md)[1]))
 
     elif args.mode == "send_to_pickle":
 

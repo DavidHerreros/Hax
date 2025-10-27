@@ -174,10 +174,11 @@ def main():
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.networks import train_step_image_adjustment
+    from hax.metrics import JaxSummaryWriter
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp metadata file with the images (+ alignments / CTF) to be analyzed")
+                        help="Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed")
     parser.add_argument("--vol", required=True, type=str,
                         help="Volume needed to generate the projections to be adjusted")
     parser.add_argument("--mask", required=False, type=str,
@@ -257,9 +258,17 @@ def main():
 
         imageAdjustment.train()
 
+        # Prepare summary writer
+        writer = JaxSummaryWriter(os.path.join(args.output_path, "Image_adjustment_metrics"))
+
         # Prepare data loader
         data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
                                                   mmap=mmap, mmap_output_dir=mmap_output_dir)
+
+        # Example of training data for Tensorboard
+        x_example, labels_example = next(iter(data_loader))
+        x_example = jax.vmap(min_max_scale)(x_example)
+        writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
         # Optimizers
         optimizer = nnx.Optimizer(imageAdjustment, optax.adam(args.learning_rate))
@@ -282,6 +291,13 @@ def main():
 
                 # Progress bar update  (TQDM)
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+
+                # Summary writer (training loss)
+                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
+                    writer.add_scalar('Training loss (image adjustment)',
+                                      total_loss / step,
+                                      i * len(data_loader) + step)
+
                 step += 1
         imageAdjustment, optimizer = nnx.merge(graphdef, state)
 
@@ -319,7 +335,7 @@ def main():
         for idx in range(len(md)):
             image_id, _ = md["image"].split('@')
             md[idx, "image"] = "@".join([image_id, output_images_path])
-        md.write(os.path.join(args.output_path, "adjusted_images.xmd"))
+        md.write(os.path.join(args.output_path, "adjusted_images" +  os.path.splitext(args.md)[1]))
 
 if __name__ == "__main__":
     main()
