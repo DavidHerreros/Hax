@@ -222,7 +222,7 @@ def main():
                              f'given, the network will attempt to indentify automatically your method.'
                              f"{bcolors.WARNING}WARNING{bcolors.ENDC}: The spaces stored in the files MUST have the SAME number of elements and they MUST be "
                              f"ordered (i.e. the first element in the files is the latent vector obtained from the first image and so on).")
-    parser.add_argument("--lat_dim", required=False,
+    parser.add_argument("--lat_dim", required=False, type=int,
                         help="Dimensionality of the latent space of the network (by default, it is set to the minimum dimension of all the provided input spaces)")
     parser.add_argument("--mode", required=True, type=str, choices=["train", "predict", "send_to_pickle"],
                         help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
@@ -277,7 +277,7 @@ def main():
     if args.lat_dim is None:
         lat_dim = 2 ** 32 - 1
         for input_space in input_spaces:
-            lat_dim = min(lat_dim, input_space.shape[0])
+            lat_dim = min(lat_dim, input_space.shape[1])
     else:
         lat_dim = args.lat_dim
 
