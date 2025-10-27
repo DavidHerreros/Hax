@@ -338,7 +338,7 @@ def main():
                     writer.add_scalar('Encoder loss (FlexConsensus)',
                                       encoder_loss / step,
                                       i * len(data_loader) + step)
-                    for key, value in total_encoder_loss.items():
+                    for key, value in total_decoder_loss.items():
                         writer.add_scalar(f'Decoder loss ({key})',
                                           value / step,
                                           i * len(data_loader) + step)
