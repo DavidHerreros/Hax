@@ -694,36 +694,7 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md):
 
     return rotations, shifts
 
-@jax.jit
-def euler_from_matrix(matrix):
-    # Only valid for Xmipp axes szyz
-    firstaxis, parity, repetition, frame = (2, 1, 1, 0)
-    _EPS = jnp.finfo(float).eps * 4.0
-    _NEXT_AXIS = [1, 2, 0, 1] # axis sequences for Euler angles
-
-    i = firstaxis
-    j = _NEXT_AXIS[i + parity]
-    k = _NEXT_AXIS[i - parity + 1]
-
-    M = jnp.array(matrix, dtype=jnp.float32, copy=False)
-    if repetition:
-        sy = jnp.sqrt(M[i, j] * M[i, j] + M[i, k] * M[i, k])
-        ax = jnp.where(sy > _EPS, jnp.atan2(M[i, j], M[i, k]), jnp.atan2(-M[j, k], M[j, j]))
-        ay = jnp.atan2(sy, M[i, i])
-        az = jnp.where(sy > _EPS, jnp.atan2(M[j, i], -M[k, i]), 0.0)
-    else:
-        cy = jnp.sqrt(M[i, i] * M[i, i] + M[j, i] * M[j, i])
-        ax = jnp.where(cy > _EPS, jnp.atan2(M[k, j], M[k, k]), jnp.atan2(-M[j, k], M[j, j]))
-        ay = jnp.atan2(-M[k, i], cy)
-        az = jnp.where(cy > _EPS, jnp.atan2(M[j, i], M[i, i]), 0.0)
-
-    if parity:
-        ax, ay, az = -ax, -ay, -az
-    if frame:
-        ax, az = az, ax
-    return jnp.stack([ax, ay, az], axis=0)
-
-euler_from_matrix_batch = jax.vmap(euler_from_matrix)
+euler_from_matrix_batch = jax.vmap(jax.jit(euler_from_matrix))
 
 def xmippEulerFromMatrix(matrix):
     return -jnp.rad2deg(euler_from_matrix_batch(matrix))
