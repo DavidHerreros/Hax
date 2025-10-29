@@ -275,12 +275,12 @@ class DeltaVolumeDecoder(nnx.Module):
                                bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
         else:
             bamp = values
-            bposi = jnp.floor(coords).astype(jnp.int32)
+            bposi = jnp.tile(jnp.floor(coords).astype(jnp.int32), (x.shape[0], 1, 1))
 
         def scatter_volume(vol, bpos_i, bamp_i):
             return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
 
-        grids = jax.vmap(scatter_volume, in_axes=(0, None, 0))(grids, bposi, bamp)
+        grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, bposi, bamp)
 
         # Filter volume
         if filter:
