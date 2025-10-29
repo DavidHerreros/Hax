@@ -434,9 +434,9 @@ class Zernike3Deep(nnx.Module):
         return grids
 
 @jax.jit
-def train_step_zernike3deep(graphdef, state, x, labels, md):
+def train_step_zernike3deep(graphdef, state, x, labels, md, key):
     model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
-    distributions_key = jnr.PRNGKey(random.randint(0, 2 ** 32 - 1))
+    distributions_key, key = jax.split(key)
 
     def loss_fn_ot(model, x):
         # Encode latent E(z)
@@ -571,7 +571,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md):
 
     state = nnx.state((model, optimizer, optimizer_grays))
 
-    return loss, state
+    return loss, state, key
 
 
 def main():
@@ -786,7 +786,7 @@ def main():
             pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
 
             for (x, labels) in pbar:
-                loss, state = train_step_zernike3deep(graphdef, state, x, labels, md_columns)
+                loss, state, rng = train_step_zernike3deep(graphdef, state, x, labels, md_columns, rng)
                 total_loss += loss
 
                 # Progress bar update  (TQDM)

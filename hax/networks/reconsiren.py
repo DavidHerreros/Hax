@@ -415,11 +415,10 @@ class ReconSIREN(nnx.Module):
 
 
 @jax.jit
-def train_step_reconsiren(graphdef, state, x, labels, md):
+def train_step_reconsiren(graphdef, state, x, labels, md, key):
     model, optimizer_pose, optimizer_volume = nnx.merge(graphdef, state)
 
     # Random keys
-    key = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     key, swd_key, uniform_key, choice_key = jax.random.split(key, 4)
 
     def loss_fn(model, x):
@@ -585,7 +584,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md):
 
     state = nnx.state((model, optimizer_pose, optimizer_volume))
 
-    return loss, recon_loss, state
+    return loss, recon_loss, state, key
 
 @jax.jit
 def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md):
@@ -938,7 +937,7 @@ def main():
             pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
 
             for (x, labels) in pbar:
-                loss, recon_loss, state = train_step_reconsiren(graphdef, state, x, labels, md_columns)
+                loss, recon_loss, state, rng = train_step_reconsiren(graphdef, state, x, labels, md_columns, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss
 

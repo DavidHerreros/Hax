@@ -470,9 +470,9 @@ class HetSIREN(nnx.Module):
 
 
 @jax.jit
-def train_step_hetsiren(graphdef, state, x, labels, md):
+def train_step_hetsiren(graphdef, state, x, labels, md, key):
     model, optimizer = nnx.merge(graphdef, state)
-    distributions_key = jnr.PRNGKey(random.randint(0, 2 ** 32 - 1))
+    distributions_key, key = jnr.split(key)
 
     def loss_fn(model, x):
         # Check if Tomo mode
@@ -659,7 +659,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md):
 
     state = nnx.state((model, optimizer))
 
-    return loss, recon_loss, state
+    return loss, recon_loss, state, key
 
 
 
@@ -918,7 +918,7 @@ def main():
             pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
 
             for (x, labels) in pbar:
-                loss, recon_loss, state = train_step_hetsiren(graphdef, state, x, labels, md_columns)
+                loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
