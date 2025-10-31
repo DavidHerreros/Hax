@@ -50,7 +50,7 @@ class Encoder(nnx.Module):
         # self.hidden_9d_rotation.append(nnx.Linear(1024, 3, rngs=rngs))
         if refine_current_assignment:
             self.hidden_9d_rotation.append(nnx.Linear(1024, self.num_components * 6, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros))
-            self.alpha = nnx.Param(jnp.array(1e-4))
+            self.alpha_rotations = nnx.Param(jnp.array(1e-4))
         else:
             self.hidden_9d_rotation.append(nnx.Linear(1024, self.num_components * 9, rngs=rngs))
 
@@ -58,7 +58,11 @@ class Encoder(nnx.Module):
         self.hidden_shifts = [nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         self.hidden_shifts.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         self.hidden_shifts.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
+        if refine_current_assignment:
+            self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros))
+            self.alpha_shifts = nnx.Param(jnp.array(1e-4))
+        else:
+            self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
 
     def __call__(self, x, return_diversity_loss=False):
         # Resize images
@@ -104,7 +108,7 @@ class Encoder(nnx.Module):
         if self.refine_current_assignment:
             rotations_6d = rotation_9d.reshape(x.shape[0] * self.num_components, 6)
             identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
-            rotation_6d = identity_6d + self.alpha * rotations_6d
+            rotation_6d = identity_6d + self.alpha_rotations * rotations_6d
             a1, a2 = jnp.split(rotation_6d, 2, axis=-1)
             b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
             a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
@@ -129,6 +133,8 @@ class Encoder(nnx.Module):
             in_plane_shifts = nnx.relu(layer(in_plane_shifts))
         # in_plane_shifts = 0.5 * self.input_dim * self.hidden_shifts[-1](in_plane_shifts)
         in_plane_shifts = self.hidden_shifts[-1](in_plane_shifts)
+        if self.refine_current_assignment:
+            in_plane_shifts = self.alpha_shifts * in_plane_shifts
 
         # Broadcast shifts to euler angles shape
         in_plane_shifts = jnp.broadcast_to(in_plane_shifts[:, None, :], (in_plane_shifts.shape[0], self.num_components, 2))
