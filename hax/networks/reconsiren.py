@@ -736,13 +736,13 @@ def main():
                              f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
     parser.add_argument("--sr", required=True, type=float,
                         help="Sampling rate of the images/volume")
-    parser.add_argument("--transport_mass", action='store_true',
-                        help=f'When set, ReconSIREN will be able to "move" the mass inside the mask instead of just reconstructing the volume. This implies that ReconSIREN will estimate the motion '
-                             f'to be applied to the points within the provided mask, instead of considering them fixed in space. This approach is useful when working with large box sizes that '
-                             f'do not fit in GPU memory, or when a more through analysis of motions is desired. {bcolors.WARNING}NOTE{bcolors.ENDC}: We strongly recommend to use this mode, as it '
-                             f'yields optimal results for most cases. {bcolors.WARNING}NOTE{bcolors.ENDC}: When this option is set and a reference volume is provided, we recommend changing the '
-                             f'reference mask to a tight mask computed from the reference volume. This mask now tells the program which regions should be moved. Therefore, consider providing a mask '
-                             f'that covers all the protein regions you would like to be analyzed by HetSIREN.')
+    # parser.add_argument("--transport_mass", action='store_true',
+    #                     help=f'When set, ReconSIREN will be able to "move" the mass inside the mask instead of just reconstructing the volume. This implies that ReconSIREN will estimate the motion '
+    #                          f'to be applied to the points within the provided mask, instead of considering them fixed in space. This approach is useful when working with large box sizes that '
+    #                          f'do not fit in GPU memory, or when a more through analysis of motions is desired. {bcolors.WARNING}NOTE{bcolors.ENDC}: We strongly recommend to use this mode, as it '
+    #                          f'yields optimal results for most cases. {bcolors.WARNING}NOTE{bcolors.ENDC}: When this option is set and a reference volume is provided, we recommend changing the '
+    #                          f'reference mask to a tight mask computed from the reference volume. This mask now tells the program which regions should be moved. Therefore, consider providing a mask '
+    #                          f'that covers all the protein regions you would like to be analyzed by HetSIREN.')
     parser.add_argument("--do_not_learn_volume", action="store_ture",
                         help="When this parameter is provided, ReconSIREN will just learn an angular assignment with shifts without learning any map. This is usually useful when a reference volume with "
                              "high resolution is provided (e.g. coming from an atomic model) and no refinement of the map is needed.")
@@ -807,7 +807,7 @@ def main():
 
     # Prepare network (ReconSIREN)
     reconsiren = ReconSIREN(vol, mask, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
-                            transport_mass=args.transport_mass, refine_current_assignment=args.refine_current_assignment,
+                            transport_mass=True, refine_current_assignment=args.refine_current_assignment,
                             bank_size=len(generator.md), learn_delta_volume=not args.do_not_learn_volume, rngs=nnx.Rngs(model_key))
 
     # Reload network
