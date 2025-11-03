@@ -47,8 +47,10 @@ def _sliced_wasserstein_pair_ott(
 
 @partial(jit, static_argnames=("number_of_directions",))
 def compute_swd_matrix(
-        coords: jnp.ndarray,
-        intensities: jnp.ndarray,
+        coords_a: jnp.ndarray,
+        coords_b: jnp.ndarray,
+        intensities_a: jnp.ndarray,
+        intensities_b: jnp.ndarray,
         number_of_directions: int,
         key: jax.random.PRNGKey
 ) -> jnp.ndarray:
@@ -74,10 +76,10 @@ def compute_swd_matrix(
         return vmap(
             _sliced_wasserstein_pair_ott,
             in_axes=(None, None, 0, 0, None, None)  # (c_i, i_i, c_j, i_j, dirs)
-        )(coords_i, intensities_i, coords, intensities, number_of_directions, key)
+        )(coords_i, intensities_i, coords_b, intensities_b, number_of_directions, key)
 
     # 2 vmap the row function over the first set of arguments (coords_i, intensities_i)
     # This "double vmap" creates the (B, B) outer-product-like computation.
-    swd_matrix = vmap(compute_row, in_axes=(0, 0))(coords, intensities)
+    swd_matrix = vmap(compute_row, in_axes=(0, 0))(coords_a, intensities_a)
 
     return swd_matrix

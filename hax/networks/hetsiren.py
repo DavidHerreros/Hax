@@ -644,7 +644,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
             # Expectation over values and rotations for speed (convergence is almost guaranteed)
             coords_swd = jnr.choice(distributions_key, coords, axis=1, shape=(100,), replace=False) / model.delta_volume_decoder.factor
             values_swd = jnr.choice(distributions_key, nnx.relu(values), axis=1, shape=(100,), replace=False)
-            volume_registration_loss = compute_swd_matrix(coords_swd, values_swd, 32, distributions_key).mean()
+            volume_registration_loss = compute_swd_matrix(coords_swd[:4], coords_swd, values_swd[:4], values_swd, 8, distributions_key).mean()
 
         # Variational loss
         if model.isVae:
