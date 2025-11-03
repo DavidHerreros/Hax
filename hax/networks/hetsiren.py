@@ -161,8 +161,7 @@ class MultiEncoder(nnx.Module):
             self.latent = Linear(256, lat_dim, rngs=rngs)
 
         # Rigid alignment to place volumes in registration
-        self.rigid_6d_rotation = nnx.Linear(256, 6, rngs=rngs, kernel_init=nnx.initializers.zeros,
-                                            bias_init=nnx.initializers.zeros)
+        self.rigid_6d_rotation = nnx.Linear(256, 6, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros)
         self.rigid_shifts = nnx.Linear(256, 2, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros)
         self.alpha_rotations = nnx.Param(jnp.array(1e-4))
         self.alpha_shifts = nnx.Param(jnp.array(1e-4))
@@ -261,24 +260,6 @@ class DeltaVolumeDecoder(nnx.Module):
             x = x + jnp.sin(1.0 * layer(x))
         x_map = self.hidden_linear[-1](x)
 
-        if self.transport_mass:
-            # Extract delta_coords and values
-            x_map = jnp.reshape(x_map, (x_map.shape[0], self.total_voxels, 4))
-            delta_coords, delta_values = x_map[..., :3], x_map[..., 3]
-
-            # Recover volume values (TODO: Check if applying ReLu is really needed)
-            # values = nnx.relu(self.reference_values + delta_values)
-            values = self.reference_values + delta_values
-
-            # Recover coords (non-normalized)
-            coords = self.factor * (self.coords + delta_coords)
-        else:
-            # Recover volume values
-            values = self.reference_values + x_map
-
-            # Recover coords (non-normalized)
-            coords = self.factor * self.coords
-
         # Estimate rotations for volume registration
         rotations_6d = self.rigid_6d_rotation(x)
         identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
@@ -291,10 +272,28 @@ class DeltaVolumeDecoder(nnx.Module):
         rotations = jnp.stack([b1, b2, b3], axis=-1)
 
         # Estimate shifts for volume registration
-        shifts = self.factor * self.alpha_shifts * self.rigid_shifts(x)
+        shifts = self.alpha_shifts * self.rigid_shifts(x)
 
         # Register coordinates
-        coords = jnp.matmul(coords, rotations) + shifts[:, None, :]
+        coords = jnp.matmul(self.coords, rotations) + shifts[:, None, :]
+
+        if self.transport_mass:
+            # Extract delta_coords and values
+            x_map = jnp.reshape(x_map, (x_map.shape[0], self.total_voxels, 4))
+            delta_coords, delta_values = x_map[..., :3], x_map[..., 3]
+
+            # Recover volume values (TODO: Check if applying ReLu is really needed)
+            values = nnx.relu(self.reference_values + delta_values)
+            # values = self.reference_values + delta_values
+
+            # Recover coords (non-normalized)
+            coords = self.factor * (coords + delta_coords)
+        else:
+            # Recover volume values
+            values = self.reference_values + x_map
+
+            # Recover coords (non-normalized)
+            coords = self.factor * coords
 
         return coords, values
 
@@ -361,6 +360,7 @@ class PhysDecoder:
             rotations = euler_matrix_batch(rotations[:, 0], rotations[:, 1], rotations[:, 2])
 
             if rotations_refinement is not None:
+                # rotations = jnp.matmul(rotations_refinement, rotations)
                 rotations = jnp.matmul(rotations, rotations_refinement)
 
         if shifts_refinement is not None:
@@ -684,7 +684,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
         else:
             decoupling_loss = 0.0
 
-        loss = recon_loss + 0.0001 * kl_loss + 0.001 * decoupling_loss + l1_loss  + 0.1 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss + volume_registration_loss
+        loss = recon_loss + 0.0001 * kl_loss + 0.001 * decoupling_loss + 0.01 * l1_loss  + 0.01 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss + volume_registration_loss
         return loss, (recon_loss, latent)
 
     # Check if Tomo mode
