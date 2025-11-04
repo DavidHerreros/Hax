@@ -345,6 +345,29 @@ class DeltaVolumeDecoder(nnx.Module):
 
         return grids
 
+    def decode_rigid_alignment(self, x):
+        # Decode voxel values
+        x = jnp.sin(30.0 * self.hidden_linear[0](x))
+        for layer in self.hidden_linear[1:-1]:
+            # x = jnp.sin(1.0 * (x + layer(x, x)))
+            x = x + jnp.sin(1.0 * layer(x))
+
+        # Estimate rotations for volume registration
+        rotations_6d = self.rigid_6d_rotation(x)
+        identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
+        rotation_6d = identity_6d + self.alpha_rotations * rotations_6d
+        a1, a2 = jnp.split(rotation_6d, 2, axis=-1)
+        b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
+        a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
+        b2 = a2_ortho / jnp.clip(jnp.linalg.norm(a2_ortho, axis=-1, keepdims=True), a_min=1e-6)
+        b3 = jnp.cross(b1, b2, axis=-1)
+        rotations = jnp.stack([b1, b2, b3], axis=-1)
+
+        # Estimate shifts for volume registration
+        shifts = self.factor * self.alpha_shifts * self.rigid_shifts(x)
+
+        return rotations, shifts
+
 class PhysDecoder:
     def __init__(self, xsize, transport_mass):
         self.xsize = xsize
@@ -1111,6 +1134,7 @@ def main():
                 x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
             latents_batch, (rotations_refinement, shifts_refinement) = predict_fn(x)
+            rotations_rigid_registration, shifts_rigid_registration = predict_rigid_registration(x)
 
             # Precompute batch aligments
             rotations_batch = md_columns["euler_angles"][labels]
@@ -1121,13 +1145,13 @@ def main():
             # Get rotation matrices
             if rotations_batch.ndim == 2:
                 rotations_batch = euler_matrix_batch(rotations_batch[:, 0], rotations_batch[:, 1], rotations_batch[:, 2])
-                rotations_batch = jnp.matmul(rotations_batch, rotations_refinement)
+                rotations_batch = jnp.matmul(rotations_batch, jnp.matmul(rotations_refinement, rotations_rigid_registration))
 
             # Convert rotation to Euler angles in Xmipp format
             euler_angles_batch = xmippEulerFromMatrix(rotations_batch)
 
             # Convert to Numpy
-            euler_angles_batch, shifts_batch = np.array(euler_angles_batch), np.array(shifts_batch + shifts_refinement)
+            euler_angles_batch, shifts_batch = np.array(euler_angles_batch), np.array(shifts_batch + shifts_refinement + shifts_rigid_registration)
 
             latents.append(latents_batch)
             euler_angles.append(euler_angles_batch)
