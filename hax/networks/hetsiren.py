@@ -659,15 +659,27 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
             hist_loss = 0.0
 
         # Volume registration loss
-        if model.delta_volume_decoder.transport_mass:
-            coords_for_registration = coords / model.delta_volume_decoder.factor
-            distances_coords = jnp.sum(jnp.square(coords_for_registration[:, None, :, :] - coords_for_registration[None, :, :, :]), axis=-1)
-            volume_registration_loss = distances_coords.mean()
-        else:
-            # Expectation over values and rotations for speed (convergence is almost guaranteed)
-            coords_swd = jnr.choice(distributions_key, coords, axis=1, shape=(100,), replace=False) / model.delta_volume_decoder.factor
-            values_swd = jnr.choice(distributions_key, nnx.relu(values), axis=1, shape=(100,), replace=False)
-            volume_registration_loss = compute_swd_matrix(coords_swd[:4], coords_swd, values_swd[:4], values_swd, 8, distributions_key).mean()
+        # if model.delta_volume_decoder.transport_mass:
+        #     coords_for_registration = coords #/ model.delta_volume_decoder.factor
+        #     distances_coords = jnp.sum(jnp.square(coords_for_registration[:, None, :, :] - coords_for_registration[None, :, :, :]), axis=-1)
+        #     volume_registration_loss = distances_coords.mean()
+        # else:
+        # Expectation over values and rotations for speed (convergence is almost guaranteed)
+        coords_swd = jnr.choice(distributions_key, model.delta_volume_decoder.coords, axis=1, shape=(1000,), replace=False) / model.delta_volume_decoder.factor
+        values_swd = jnr.choice(distributions_key, nnx.relu(values), axis=1, shape=(1000,), replace=False)
+        coords_swd_reference = jnr.choice(distributions_key, model.delta_volume_decoder.coords, axis=1, shape=(1000,), replace=False)
+        values_swd_reference = jnr.choice(distributions_key, nnx.relu(model.delta_volume_decoder.reference_values), axis=1, shape=(1000,), replace=False)
+        coords_swd_reference = jnp.tile(coords_swd_reference, (x.shape[0], 1, 1))
+        values_swd_reference = jnp.tile(values_swd_reference, (x.shape[0], 1))
+        volume_registration_loss = compute_swd_matrix(coords_swd_reference, coords_swd, values_swd_reference, values_swd, 64, distributions_key).mean()
+
+        # Volume registration loss (with volumes)
+        # def scatter_volume(vol, bpos_i, bamp_i):
+        #     return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
+        # grids = jnp.zeros((values.shape[0], 32, 32, 32))
+        # coords_vr = jnp.round(16. * coords / model.delta_volume_decoder.factor + 16.).astype(jnp.int32)
+        # grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, coords_vr, nnx.relu(values))
+        # volume_registration_loss = jnp.square(grids[:, None, ...] - grids[None, ...]).mean()
 
         # Variational loss
         if model.isVae:
@@ -1107,6 +1119,7 @@ def main():
 
         # Jitted prediction function
         predict_fn = jax.jit(hetsiren.__call__)
+        predict_rigid_registration = jax.jit(hetsiren.delta_volume_decoder.decode_rigid_alignment)
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting HetSIREN latents... ######")
