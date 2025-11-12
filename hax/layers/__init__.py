@@ -4,3 +4,4 @@ from .residual import ResBlock
 from .attention import Attention
 from .hypernetworks import HyperLinear
 from .nnx_wrappers import Linear, Conv, ConvTranspose
+from .pose import PoseDistMatrix, sample_topM_R, importance_weights
