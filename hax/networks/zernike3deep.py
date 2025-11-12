@@ -775,6 +775,8 @@ def main():
             model, _ = nnx.merge(graphdef, state)
             return model.decode_volume(x)
 
+        image_resize = jax.jit(jax.image.resize, static_argnames=("shape", "method"))
+
         # Training loop (Zernike3Deep)
         print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
         for i in range(args.epochs):
@@ -834,6 +836,7 @@ def main():
                     x_pred_intermediate = zernike3deep_decode_image(graphdef, state, latents, random_labels,
                                                                     md_columns, ctf_type=None, return_latent=False,
                                                                     corrupt_projection_with_ctf=False)
+                    x_pred_intermediate = image_resize(x_pred_intermediate[..., None], (latents.shape[0], 128, 128, 1), method="bilinear")[..., 0]
                     latents_images.append(np.asarray(x_pred_intermediate))
                 latents_images = np.concatenate(latents_images, axis=0)
                 latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)

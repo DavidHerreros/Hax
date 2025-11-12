@@ -50,7 +50,7 @@ class Encoder(nnx.Module):
         # self.hidden_9d_rotation.append(nnx.Linear(1024, 3, rngs=rngs))
         if refine_current_assignment:
             self.hidden_9d_rotation.append(nnx.Linear(1024, self.num_components * 6, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros))
-            self.alpha = nnx.Param(jnp.array(1e-4))
+            self.alpha_rotations = nnx.Param(jnp.array(1e-4))
         else:
             self.hidden_9d_rotation.append(nnx.Linear(1024, self.num_components * 9, rngs=rngs))
 
@@ -58,7 +58,11 @@ class Encoder(nnx.Module):
         self.hidden_shifts = [nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         self.hidden_shifts.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         self.hidden_shifts.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
+        if refine_current_assignment:
+            self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros))
+            self.alpha_shifts = nnx.Param(jnp.array(1e-4))
+        else:
+            self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
 
     def __call__(self, x, return_diversity_loss=False):
         # Resize images
@@ -104,7 +108,7 @@ class Encoder(nnx.Module):
         if self.refine_current_assignment:
             rotations_6d = rotation_9d.reshape(x.shape[0] * self.num_components, 6)
             identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
-            rotation_6d = identity_6d + self.alpha * rotations_6d
+            rotation_6d = identity_6d + self.alpha_rotations * rotations_6d
             a1, a2 = jnp.split(rotation_6d, 2, axis=-1)
             b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
             a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
@@ -129,6 +133,8 @@ class Encoder(nnx.Module):
             in_plane_shifts = nnx.relu(layer(in_plane_shifts))
         # in_plane_shifts = 0.5 * self.input_dim * self.hidden_shifts[-1](in_plane_shifts)
         in_plane_shifts = self.hidden_shifts[-1](in_plane_shifts)
+        if self.refine_current_assignment:
+            in_plane_shifts = self.alpha_shifts * in_plane_shifts
 
         # Broadcast shifts to euler angles shape
         in_plane_shifts = jnp.broadcast_to(in_plane_shifts[:, None, :], (in_plane_shifts.shape[0], self.num_components, 2))
@@ -345,6 +351,9 @@ class ReconSIREN(nnx.Module):
                                                        transport_mass=transport_mass, learn_delta_volume=learn_delta_volume, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize, transport_mass=transport_mass)
 
+        # Hyperparameter tuning
+        self.alpha_uniform = nnx.Param(1e-4)
+
         #### Memory bank for latent spaces ####
         self.bank_size = bank_size
         self.subset_size = min(2048, bank_size)
@@ -473,7 +482,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
             images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
 
         # Broadcast input images to right size
-        x_loss = jnp.broadcast_to(x_loss[:, None, ...], (x_loss.shape[0], images_corrected.shape[1], x_loss.shape[1], x_loss.shape[2], 1))
+        x_loss = jnp.broadcast_to(x_loss[:, None, ...], (x_loss.shape[0], images_corrected.shape[1], x_loss.shape[1], x_loss.shape[2]))
 
         # Project "mask"
         if not model.delta_volume_decoder.transport_mass:
@@ -500,12 +509,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         rotations = rotations[jnp.arange(images_corrected.shape[0]), min_indices, :]
 
         # Rotations to Euler angles (ZYZ)
-        tilt = jnp.arccos(jnp.clip(rotations[:, 2, 2], -1.0, 1.0))
-        is_singular = jnp.logical_or(jnp.abs(tilt) < 1e-6, jnp.abs(tilt - jnp.pi) < 1e-6)
-        rot_reg = jnp.arctan2(rotations[:, 1, 2], rotations[:, 0, 2])
-        rot_sing = jnp.arctan2(-rotations[:, 0, 1], rotations[:, 0, 0])
-        rot = jnp.where(is_singular, rot_sing, rot_reg)
-        euler_angles = jnp.stack([rot, tilt], axis=1)
+        euler_angles = euler_from_matrix_batch(rotations)[..., :2]
 
         # L1 based denoising
         if not model.delta_volume_decoder.transport_mass:
@@ -530,12 +534,12 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         uniform_angular_distribution_loss = sliced_wasserstein_loss(memory_bank_subset, uniform_distributed_samples, key)
 
         # loss = recon_loss + l1_loss  + 0.001 * (l1_grad_loss + l2_grad_loss) # + 0.001 * uniform_angular_distribution_loss
-        loss = recon_loss + l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + 1e-6 * uniform_angular_distribution_loss + 1e-6 * diversity_loss
+        loss = recon_loss + l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + nnx.relu(model.alpha_uniform.value) * uniform_angular_distribution_loss + nnx.relu(model.alpha_uniform.value) * diversity_loss
         return loss, (recon_loss, euler_angles)
 
 
     # Optimizer parameters
-    params_pose = nnx.All(nnx.Param, nnx.PathContains('encoder'))
+    params_pose = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('alpha_uniform')))
     params_volume = nnx.All(nnx.Param, nnx.PathContains('delta_volume_decoder'))
 
     if model.refine_current_assignment:
@@ -666,7 +670,7 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md):
         images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
 
     # Broadcast input images to right size
-    x_loss = jnp.broadcast_to(x_loss[:, None, ...], (x_loss.shape[0], images_corrected.shape[1], x_loss.shape[1], x_loss.shape[2], 1))
+    x_loss = jnp.broadcast_to(x_loss[:, None, ...], (x_loss.shape[0], images_corrected.shape[1], x_loss.shape[1], x_loss.shape[2]))
 
     # Project "mask"
     if not model.delta_volume_decoder.transport_mass:
@@ -694,36 +698,7 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md):
 
     return rotations, shifts
 
-@jax.jit
-def euler_from_matrix(matrix):
-    # Only valid for Xmipp axes szyz
-    firstaxis, parity, repetition, frame = (2, 1, 1, 0)
-    _EPS = jnp.finfo(float).eps * 4.0
-    _NEXT_AXIS = [1, 2, 0, 1] # axis sequences for Euler angles
-
-    i = firstaxis
-    j = _NEXT_AXIS[i + parity]
-    k = _NEXT_AXIS[i - parity + 1]
-
-    M = jnp.array(matrix, dtype=jnp.float32, copy=False)
-    if repetition:
-        sy = jnp.sqrt(M[i, j] * M[i, j] + M[i, k] * M[i, k])
-        ax = jnp.where(sy > _EPS, jnp.atan2(M[i, j], M[i, k]), jnp.atan2(-M[j, k], M[j, j]))
-        ay = jnp.atan2(sy, M[i, i])
-        az = jnp.where(sy > _EPS, jnp.atan2(M[j, i], -M[k, i]), 0.0)
-    else:
-        cy = jnp.sqrt(M[i, i] * M[i, i] + M[j, i] * M[j, i])
-        ax = jnp.where(cy > _EPS, jnp.atan2(M[k, j], M[k, k]), jnp.atan2(-M[j, k], M[j, j]))
-        ay = jnp.atan2(-M[k, i], cy)
-        az = jnp.where(cy > _EPS, jnp.atan2(M[j, i], M[i, i]), 0.0)
-
-    if parity:
-        ax, ay, az = -ax, -ay, -az
-    if frame:
-        ax, az = az, ax
-    return jnp.stack([ax, ay, az], axis=0)
-
-euler_from_matrix_batch = jax.vmap(euler_from_matrix)
+euler_from_matrix_batch = jax.vmap(jax.jit(euler_from_matrix))
 
 def xmippEulerFromMatrix(matrix):
     return -jnp.rad2deg(euler_from_matrix_batch(matrix))
@@ -736,6 +711,7 @@ def main():
     import random
     import numpy as np
     import argparse
+    import matplotlib.pyplot as plt
     from xmipp_metadata.image_handler import ImageHandler
     import optax
     from hax.checkpointer import NeuralNetworkCheckpointer
@@ -759,23 +735,23 @@ def main():
                              f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
     parser.add_argument("--sr", required=True, type=float,
                         help="Sampling rate of the images/volume")
-    parser.add_argument("--transport_mass", action='store_true',
-                        help=f'When set, ReconSIREN will be able to "move" the mass inside the mask instead of just reconstructing the volume. This implies that ReconSIREN will estimate the motion '
-                             f'to be applied to the points within the provided mask, instead of considering them fixed in space. This approach is useful when working with large box sizes that '
-                             f'do not fit in GPU memory, or when a more through analysis of motions is desired. {bcolors.WARNING}NOTE{bcolors.ENDC}: We strongly recommend to use this mode, as it '
-                             f'yields optimal results for most cases. {bcolors.WARNING}NOTE{bcolors.ENDC}: When this option is set and a reference volume is provided, we recommend changing the '
-                             f'reference mask to a tight mask computed from the reference volume. This mask now tells the program which regions should be moved. Therefore, consider providing a mask '
-                             f'that covers all the protein regions you would like to be analyzed by HetSIREN.')
-    parser.add_argument("--do_not_learn_volume", action="store_ture",
+    # parser.add_argument("--transport_mass", action='store_true',
+    #                     help=f'When set, ReconSIREN will be able to "move" the mass inside the mask instead of just reconstructing the volume. This implies that ReconSIREN will estimate the motion '
+    #                          f'to be applied to the points within the provided mask, instead of considering them fixed in space. This approach is useful when working with large box sizes that '
+    #                          f'do not fit in GPU memory, or when a more through analysis of motions is desired. {bcolors.WARNING}NOTE{bcolors.ENDC}: We strongly recommend to use this mode, as it '
+    #                          f'yields optimal results for most cases. {bcolors.WARNING}NOTE{bcolors.ENDC}: When this option is set and a reference volume is provided, we recommend changing the '
+    #                          f'reference mask to a tight mask computed from the reference volume. This mask now tells the program which regions should be moved. Therefore, consider providing a mask '
+    #                          f'that covers all the protein regions you would like to be analyzed by HetSIREN.')
+    parser.add_argument("--do_not_learn_volume", action="store_true",
                         help="When this parameter is provided, ReconSIREN will just learn an angular assignment with shifts without learning any map. This is usually useful when a reference volume with "
                              "high resolution is provided (e.g. coming from an atomic model) and no refinement of the map is needed.")
-    parser.add_argument("--refine_current_assignment", action="store_ture",
+    parser.add_argument("--refine_current_assignment", action="store_true",
                         help=f"If your input metadata has already and angular assignment and shifts, you can provide this option to refine those angles instead of finding an {bcolors.ITALIC}ab initio{bcolors.ENDC} "
                              f"alignment.")
     parser.add_argument("--symmetry_group", type=str, default="c1",
                         help=f"If your protein has any kind of symmetry, you may pass it here so that it is considered while learning the angular assignment and the volume ({bcolors.WARNING}NOTE{bcolors.ENDC}: "
                              f"only {bcolors.ITALIC}c*{bcolors.ENDC} and {bcolors.ITALIC}d*{bcolors.ENDC} symmetry groups are currently supported - the parameter is lower case sensitive - even if symmetry is provided, "
-                             f"the network will learn a {bcolors.ITALIC}symmetry break{bcolors.ENDC} set of angles in c1. Therefore, the angles can be directly used in a reconstruction/refinement.)")
+                             f"the network will learn a {bcolors.ITALIC}symmetry broken{bcolors.ENDC} set of angles in c1. Therefore, the angles can be directly used in a reconstruction/refinement.)")
     parser.add_argument("--ctf_type", required=True, type=str, choices=["None", "apply", "wiener", "precorrect"],
                         help="Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")
     parser.add_argument("--mode", required=True, type=str, choices=["train", "predict", "send_to_pickle"],
@@ -800,6 +776,17 @@ def main():
                         help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data).")
     args = parser.parse_args()
 
+    # Matplotlib plot style
+    plt.style.use('dark_background')  # This sets many defaults for a dark theme
+    plt.rcParams['text.color'] = 'white'
+    plt.rcParams['axes.labelcolor'] = 'white'
+    plt.rcParams['xtick.color'] = 'white'
+    plt.rcParams['ytick.color'] = 'white'
+    plt.rcParams['axes.edgecolor'] = 'white'
+    plt.rcParams['figure.facecolor'] = 'black'
+    plt.rcParams['axes.facecolor'] = 'black'
+    plt.rcParams['savefig.facecolor'] = 'black'
+
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
     md_columns = extract_columns(generator.md)
@@ -814,7 +801,7 @@ def main():
     if args.mask is not None:
         mask = ImageHandler(args.mask).getData()
     else:
-        mask = ImageHandler().createCircularMask(boxSize=xsize, is3D=True)
+        mask = ImageHandler().createCircularMask(boxSize=xsize, radius=int(0.125 * xsize), is3D=True)
 
     # Data loading approach
     if args.load_images_to_ram:
@@ -830,7 +817,7 @@ def main():
 
     # Prepare network (ReconSIREN)
     reconsiren = ReconSIREN(vol, mask, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
-                            transport_mass=args.transport_mass, refine_current_assignment=args.refine_current_assignment,
+                            transport_mass=True, refine_current_assignment=args.refine_current_assignment,
                             bank_size=len(generator.md), learn_delta_volume=not args.do_not_learn_volume, rngs=nnx.Rngs(model_key))
 
     # Reload network
@@ -860,6 +847,12 @@ def main():
 
         # Prepare summary writer
         writer = JaxSummaryWriter(os.path.join(args.output_path, "ReconSIREN_metrics"))
+
+        # Jitted functions for volume prediction
+        @jax.jit
+        def decode_volume(graphdef, state):
+            model, _, _ = nnx.merge(graphdef, state)
+            return model.delta_volume_decoder.decode_volume()
 
         # Prepare data loader
         data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
@@ -911,17 +904,17 @@ def main():
             volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
             values = volumeAdjustment()
 
-            # Place values on grid and replace HetSIREN reference volume
+            # Place values on grid and replace ReconSIREN reference volume
             grid = jnp.zeros_like(vol)
             grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
             reconsiren.reference_volume = grid
             reconsiren.delta_volume_decoder.reference_values = values
 
         # Optimizers (ReconSIREN)
-        params_pose = nnx.All(nnx.Param, nnx.PathContains('encoder'))
+        params_pose = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('alpha_uniform')))
         params_volume = nnx.All(nnx.Param, nnx.PathContains('delta_volume_decoder'))
         optimizer_pose = nnx.Optimizer(reconsiren, optax.adam(args.learning_rate), wrt=params_pose)
-        optimizer_volume = nnx.Optimizer(reconsiren, optax.adam(min(10. * args.learning_rate, 1e-3)), wrt=params_volume)
+        optimizer_volume = nnx.Optimizer(reconsiren, optax.adam(1e-3), wrt=params_volume)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume))
 
         # Training loop (ReconSIREN)
@@ -954,14 +947,25 @@ def main():
                                       i * len(data_loader) + step)
                 step += 1
 
-        reconsiren, optimizer_pose, optimizer_volume = nnx.merge(graphdef, state)
+            if i % 5 == 0:
+                # Example of predicted data for Tensorboard
+                volume = decode_volume(graphdef, state)
+                middle_slize = int(np.round(0.5 * volume.shape[-1]))
+                ImageHandler().write(np.array(volume), os.path.join(args.output_path, "reconsiren_map_intermediate.mrc"),
+                                     overwrite=True)
+                slice_xy, slice_xz, slice_yz = (min_max_scale(volume[0, middle_slize, :, :]),
+                                                min_max_scale(volume[0, :, middle_slize, :]),
+                                                min_max_scale(volume[0, :, :, middle_slize]))
+                slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
+                writer.add_images("Predicted volume (slices)", slices, dataformats="NHWC", global_step=i)
 
-        # Example of predicted data for Tensorboard
-        if not args.do_not_learn_volume:
-            volume = reconsiren.delta_volume_decoder.decode_volume()
-            volume_example = jax.vmap(min_max_scale)(volume[..., None])
-            writer.add_images("Predicted volume (slices)", volume_example, dataformats="NHWC")
-            ImageHandler().write(np.array(volume), os.path.join(args.output_path, "reconsiren_volume.mrc"))
+                # Plot angular distribution
+                reconsiren_intermediate, _, _ = nnx.merge(graphdef, state)
+                euler_angles = np.array(reconsiren_intermediate.memory_bank.value)
+                fig, _ = plot_angular_distribution(euler_angles)
+                writer.add_figure("Angular distribution density", fig, global_step=i)
+
+        reconsiren, optimizer_pose, optimizer_volume = nnx.merge(graphdef, state)
 
         # Save model
         NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"), mode="pickle")
@@ -976,6 +980,9 @@ def main():
         data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False,
                                                   mmap=mmap, mmap_output_dir=mmap_output_dir)
 
+        # Jitted functions for volume prediction
+        decode_volume = jax.jit(reconsiren.delta_volume_decoder.decode_volume)
+
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting angular assignment / shifts... ######")
 
@@ -986,7 +993,7 @@ def main():
         graphdef, state = nnx.split(reconsiren)
         md_pred = generator.md
         for (x, labels) in pbar:
-            rotations, shifts = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_pred)
+            rotations, shifts = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_columns)
 
             # Convert rotation to Euler angles in Xmipp format
             euler_angles = xmippEulerFromMatrix(rotations)
@@ -1001,7 +1008,13 @@ def main():
             md_pred[labels, 'shiftX'] = shifts[:, 0]
             md_pred[labels, 'shiftY'] = shifts[:, 1]
 
-        md_pred.write(os.path.join(args.output_path, "predicted_pose_shifts" +  + os.path.splitext(args.md)[1]))
+        md_pred.write(os.path.join(args.output_path, "predicted_pose_shifts" + os.path.splitext(args.md)[1]))
+
+        # Predict volume
+        print(f"{bcolors.OKCYAN}\n###### Predicting volume... ######")
+
+        decoded_volume = decode_volume()
+        ImageHandler().write(np.array(decoded_volume), os.path.join(args.output_path, "reconsiren_map.mrc"), overwrite=True)
 
 if __name__ == "__main__":
     main()

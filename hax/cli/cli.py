@@ -16,7 +16,8 @@ MODULES_DICT = {
     "decode_states_from_latents": ("hax.programs.decode_states_from_latents", "Decode a set of volumes given a network (Zernike3D or HetSIREN) and a set of latent vectors"),
     "filter_latents": ("hax.programs.filter_latents", "Filtering of latent spaces based on z-scores"),
     "display_metrics": ("hax.metrics.writer", "Display the model metrics (training curves, validation curves...) extracted while training a neural network"),
-    "annotate_space": ("hax.viewers.annotate_space.annotate_space", "Interactive latent space analysis with real time map generation")
+    "annotate_space": ("hax.viewers.annotate_space.annotate_space", "Interactive latent space analysis with real time map generation"),
+    "reconsiren": ("hax.networks.reconsiren", "Ab initio estimation of particle pose, shifts and initial volume with neural networks")
 }
 
 

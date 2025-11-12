@@ -237,43 +237,44 @@ def rigid_registration(A: jnp.ndarray, B: jnp.ndarray):
         A ≈ B @ R.T + t
 
     Args:
-      A: jnp.ndarray, shape (N, D) — target point cloud
-      B: jnp.ndarray, shape (N, D) — source point cloud (to be aligned)
+      A: jnp.ndarray, shape (..., N, D) — target point cloud
+      B: jnp.ndarray, shape (..., N, D) — source point cloud (to be aligned)
 
     Returns:
-      R: jnp.ndarray, shape (D, D) — optimal rotation matrix
-      t: jnp.ndarray, shape (D,)   — optimal translation vector
-      B_aligned: jnp.ndarray, shape (N, D) — B rotated and translated
+      R: jnp.ndarray, shape (..., D, D) — optimal rotation matrix
+      t: jnp.ndarray, shape (..., D)   — optimal translation vector
+      B_aligned: jnp.ndarray, shape (..., N, D) — B rotated and translated
     """
     # 1) Compute centroids
-    mu_A = jnp.mean(A, axis=0)
-    mu_B = jnp.mean(B, axis=0)
+    mu_A = jnp.mean(A, axis=-2)
+    mu_B = jnp.mean(B, axis=-2)
 
     # 2) Center the clouds
-    A_centered = A - mu_A
-    B_centered = B - mu_B
+    A_centered = A - mu_A[..., None, :]
+    B_centered = B - mu_B[..., None, :]
 
     # 3) Covariance matrix
-    H = A_centered.T @ B_centered   # shape (D, D)
+    H = jnp.swapaxes(B_centered, -2, -1) @ A_centered
 
     # 4) SVD of covariance
-    U, S, Vt = jnp.linalg.svd(H, full_matrices=True)
+    U, S, Vt = jnp.linalg.svd(H, full_matrices=False)
+    V = jnp.swapaxes(Vt, -2, -1)
+    Ut = jnp.swapaxes(U, -2, -1)
 
     # 5) Ensure a proper rotation (no reflection)
-    D = A.shape[1]
-    # build a diagonal matrix that flips sign if necessary
-    det_sign = jnp.sign(jnp.linalg.det(Vt.T @ U.T))
-    E = jnp.eye(D)
-    E = E.at[-1, -1].set(det_sign)
+    det = jnp.linalg.det(V @ Ut)
+    sign = jnp.where(det < 0, -1.0, 1.0)
+    V = V.at[..., :, -1].set(V[..., :, -1] * sign[..., None])
 
     # 6) Compute rotation
-    R = Vt.T @ E @ U.T
+    R = V @ Ut
+    # R = jnp.swapaxes(R, -2, -1)
 
     # 7) Compute translation
-    t = mu_A - (mu_B @ R.T)
+    t = mu_A - jnp.einsum('...ij,...j->...i', R, mu_B)
 
     # 8) Apply transform
-    B_aligned = (B @ R.T) + t
+    B_aligned = jnp.einsum('...ij,...nj->...ni', R, B) + t[..., None, :]
 
     return R, t, B_aligned
 
