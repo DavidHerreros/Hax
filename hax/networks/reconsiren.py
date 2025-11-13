@@ -980,6 +980,9 @@ def main():
                 fig, _ = plot_angular_distribution(euler_angles)
                 writer.add_figure("Angular distribution density", fig, global_step=i)
 
+                # Save checkpoint model
+                NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"), epoch=i)
+
         reconsiren, optimizer_pose, optimizer_volume = nnx.merge(graphdef, state)
 
         # Save model
