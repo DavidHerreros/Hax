@@ -317,19 +317,17 @@ def main():
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting image adjustment... ######")
+        pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=",
+                    colour="green")
+
         imgs_adjusted = []
-        for i in range(args.epochs):
-            # For progress bar (TQDM)
-            pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=",
-                        colour="green")
-
-            for (x, labels) in pbar:
-                x = x.squeeze()
-                a, b = predict_fn(x)
-                a_reshaped = jnp.broadcast_to(a[:, None, None], x.shape)
-                b_reshaped = jnp.broadcast_to(b[:, None, None], x.shape)
-                imgs_adjusted.append((x - b_reshaped) / a_reshaped)
-
+        for (x, labels) in pbar:
+            x = x.squeeze()
+            a, b = predict_fn(x)
+            a_reshaped = jnp.broadcast_to(a[:, None, None], x.shape)
+            b_reshaped = jnp.broadcast_to(b[:, None, None], x.shape)
+            adjustment = np.asarray((x - b_reshaped) / a_reshaped)
+            imgs_adjusted.append(adjustment)
         imgs_adjusted = np.asarray(imgs_adjusted)
 
         # Save new images
