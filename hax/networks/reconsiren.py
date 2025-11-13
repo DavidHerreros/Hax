@@ -707,6 +707,7 @@ def xmippEulerFromMatrix(matrix):
 def main():
     import os
     import sys
+    import shutil
     from tqdm import tqdm
     import random
     import numpy as np
@@ -716,7 +717,6 @@ def main():
     import optax
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns
-    from hax.networks import train_step_hetsiren
     from hax.metrics import JaxSummaryWriter
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
 
@@ -811,6 +811,10 @@ def main():
         mmap = True
         mmap_output_dir = args.output_path
 
+    # If exists, clean MMAP
+    if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
+        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
+
     # Random keys
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     rng, model_key, choice_key = jax.random.split(rng, 3)
@@ -864,51 +868,60 @@ def main():
         writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
         if args.vol is not None:
-            # Optimizers (Volume Adjustment)
-            optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
-            graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
+            if not os.path.isdir(os.path.join(args.output_path, "ReconSIREN_CHECKPOINT")):
+                # Optimizers (Volume Adjustment)
+                optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
+                graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
 
-            # Number epochs (volume adjustment)
-            if len(generator.md) >= 10000:
-                num_epochs_vol = 20
-            else:
-                num_epochs_vol = 200
+                # Number epochs (volume adjustment)
+                if len(generator.md) >= 10000:
+                    num_epochs_vol = 20
+                else:
+                    num_epochs_vol = 200
 
-            # Training loop (Volume Adjustment)
-            print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
-            for i in range(num_epochs_vol):
-                total_loss = 0
+                # Training loop (Volume Adjustment)
+                print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
+                for i in range(num_epochs_vol):
+                    total_loss = 0
 
-                # For progress bar (TQDM)
-                step = 1
-                print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
-                pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
-                            colour="green")
+                    # For progress bar (TQDM)
+                    step = 1
+                    print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
+                    pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
+                                colour="green")
 
-                for (x, labels) in pbar:
-                    loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
-                                                               args.ctf_type, vol.shape[0])
-                    total_loss += loss
+                    for (x, labels) in pbar:
+                        loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
+                                                                   args.ctf_type, vol.shape[0])
+                        total_loss += loss
 
-                    # Progress bar update  (TQDM)
-                    pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+                        # Progress bar update  (TQDM)
+                        pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
-                    # Summary writer (training loss)
-                    if step % int(np.ceil(0.1 * len(data_loader))) == 0:
-                        writer.add_scalar('Training loss (volume adjustment)',
-                                          total_loss / step,
-                                          i * len(data_loader) + step)
+                        # Summary writer (training loss)
+                        if step % int(np.ceil(0.1 * len(data_loader))) == 0:
+                            writer.add_scalar('Training loss (volume adjustment)',
+                                              total_loss / step,
+                                              i * len(data_loader) + step)
 
-                    step += 1
+                        step += 1
 
-            volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
-            values = volumeAdjustment()
+                volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
+                values = volumeAdjustment()
 
             # Place values on grid and replace ReconSIREN reference volume
             grid = jnp.zeros_like(vol)
             grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
             reconsiren.reference_volume = grid
             reconsiren.delta_volume_decoder.reference_values = values
+                # Place values on grid and replace ReconSIREN reference volume
+                grid = jnp.zeros_like(vol)
+                grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
+                reconsiren.reference_volume = grid
+                reconsiren.delta_volume_decoder.reference_values = values
+
+                # Save model
+                NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
         # Optimizers (ReconSIREN)
         params_pose = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('alpha_uniform')))
@@ -917,10 +930,17 @@ def main():
         optimizer_volume = nnx.Optimizer(reconsiren, optax.adam(1e-3), wrt=params_volume)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume))
 
+        # Resume if checkpoint exists
+        if os.path.isdir(os.path.join(args.output_path, "ReconSIREN_CHECKPOINT")):
+            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"))
+            print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
+        else:
+            resume_epoch = 0
+
         # Training loop (ReconSIREN)
         training_volume_log = " / volume" if not args.do_not_learn_volume else ""
         print(f"{bcolors.OKCYAN}\n###### Training angular assignment / shifts{training_volume_log}... ######")
-        for i in range(args.epochs):
+        for i in range(resume_epoch, args.epochs):
             total_loss = 0
             total_recon_loss = 0
 
@@ -969,8 +989,9 @@ def main():
 
         # Save model
         NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"), mode="pickle")
-        if args.vol is not None:
-            NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
+
+        # Remove checkpoint
+        shutil.rmtree(os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"))
 
     elif args.mode == "predict":  # TODO: Save angles here
 

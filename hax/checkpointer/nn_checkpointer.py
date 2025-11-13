@@ -53,3 +53,33 @@ class NeuralNetworkCheckpointer:
             raise ValueError(f"{bcolors.FAIL}Loading mode not implemented")
         blank_model.eval()
         return blank_model
+
+    @classmethod
+    def save_intermediate(cls, graphdef, state, checkpoint_path, epoch=None):
+        os.makedirs(checkpoint_path, exist_ok=True)
+
+        checkpoint_path = ocp.test_utils.erase_and_create_empty(os.path.abspath(os.path.join(checkpoint_path, 'checkpoints')))
+
+        with open(checkpoint_path / "binary", "wb") as binary_file:
+            if epoch is None:
+                cloudpickle.dump((graphdef, state), binary_file)
+            else:
+                cloudpickle.dump((graphdef, state, epoch), binary_file)
+
+    @classmethod
+    def load_intermediate(cls, checkpoint_path, return_as_model=False):
+        checkpoint_path = epath.Path(os.path.abspath(os.path.join(checkpoint_path, 'checkpoints')))
+
+        with open(checkpoint_path / "binary", "rb") as binary_file:
+            loaded = cloudpickle.load(binary_file)
+
+        if len(loaded) == 3:
+            graphdef, state, epoch = loaded
+        else:
+            graphdef, state = loaded
+            epoch = None
+
+        if return_as_model:
+            return nnx.merge(graphdef, state), epoch
+        else:
+            return graphdef, state, epoch

@@ -6,6 +6,7 @@ from . import programs
 from . import utils
 from . import metrics
 from . import viewers
+from . import schedulers
 
 __all__ = [
     checkpointer,
@@ -15,7 +16,8 @@ __all__ = [
     programs,
     utils,
     metrics,
-    viewers
+    viewers,
+    schedulers
 ]
 
 __version__ = '0.1.0'

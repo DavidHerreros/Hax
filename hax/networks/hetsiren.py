@@ -651,7 +651,9 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
 
         # recon_loss = dm_pix.mae(images_corrected_loss[..., None], x_loss[..., None]).mean()
         recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None])
-        recon_loss_rigid = 0.5 * (mse(images_rigid_loss[..., None], x_loss[..., None]) + mse(images_rigid_loss[..., None], images_corrected_loss[..., None]))
+        recon_loss_rigid_1 = mse(images_rigid_loss[..., None], x_loss[..., None])
+        recon_loss_rigid_2 = mse(images_rigid_loss[..., None], images_corrected_loss[..., None])
+        recon_loss_rigid = 0.5 * (recon_loss_rigid_1 + recon_loss_rigid_2)
         recons_loss_all = 0.5 * (recon_loss + recon_loss_rigid)
 
         # L1 based denoising
@@ -810,6 +812,7 @@ def main():
     from hax.networks import train_step_hetsiren
     from hax.metrics import JaxSummaryWriter
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
+    from hax.schedulers import CosineAnnealingScheduler
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
@@ -971,58 +974,74 @@ def main():
         writer.add_text("Projector warning", legend_projector)
 
         if args.vol is not None:
-            # Optimizers (Volume Adjustment)
-            optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
-            graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
+            if not os.path.isdir(os.path.join(args.output_path, "HetSIREN_CHECKPOINT")):
+                # Optimizers (Volume Adjustment)
+                optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
+                graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
 
-            # Number epochs (volume adjustment)
-            if len(generator.md) >= 10000:
-                num_epochs_vol = 20
-            else:
-                num_epochs_vol = 200
+                # Number epochs (volume adjustment)
+                if len(generator.md) >= 10000:
+                    num_epochs_vol = 20
+                else:
+                    num_epochs_vol = 200
 
-            # Training loop (Volume Adjustment)
-            print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
-            for i in range(num_epochs_vol):
-                total_loss = 0
+                # Training loop (Volume Adjustment)
+                print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
+                for i in range(num_epochs_vol):
+                    total_loss = 0
 
-                # For progress bar (TQDM)
-                step = 1
-                print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
-                pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
-                            colour="green")
+                    # For progress bar (TQDM)
+                    step = 1
+                    print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
+                    pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
+                                colour="green")
 
-                for (x, labels) in pbar:
-                    if isinstance(x, tuple):
-                        x = x[0]
+                    for (x, labels) in pbar:
+                        if isinstance(x, tuple):
+                            x = x[0]
 
-                    loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
-                                                               args.ctf_type, vol.shape[0])
-                    total_loss += loss
+                        loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
+                                                                   args.ctf_type, vol.shape[0])
+                        total_loss += loss
 
-                    # Progress bar update  (TQDM)
-                    pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+                        # Progress bar update  (TQDM)
+                        pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
-                    # Summary writer (training loss)
-                    if step % int(np.ceil(0.1 * len(data_loader))) == 0:
-                        writer.add_scalar('Training loss (volume adjustment)',
-                                          total_loss / step,
-                                          i * len(data_loader) + step)
+                        # Summary writer (training loss)
+                        if step % int(np.ceil(0.1 * len(data_loader))) == 0:
+                            writer.add_scalar('Training loss (volume adjustment)',
+                                              total_loss / step,
+                                              i * len(data_loader) + step)
 
-                    step += 1
+                        step += 1
 
-            volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
-            values = volumeAdjustment()
+                volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
+                values = volumeAdjustment()
 
             # Place values on grid and replace HetSIREN reference volume
             grid = jnp.zeros_like(vol)
             grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
             hetsiren.reference_volume = grid
             hetsiren.delta_volume_decoder.reference_values = values
+                # Place values on grid and replace HetSIREN reference volume
+                grid = jnp.zeros_like(vol)
+                grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
+                hetsiren.reference_volume = grid
+                hetsiren.delta_volume_decoder.reference_values = values
+
+                # Save model
+                NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
         # Optimizers (HetSIREN)
         optimizer = nnx.Optimizer(hetsiren, optax.adam(args.learning_rate))
         graphdef, state = nnx.split((hetsiren, optimizer))
+
+        # Resume if checkpoint exists
+        if os.path.isdir(os.path.join(args.output_path, "HetSIREN_CHECKPOINT")):
+            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"))
+            print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
+        else:
+            resume_epoch = 0
 
         # Jitted functions to improve performance
         @partial(jax.jit, static_argnames=["ctf_type", "return_latent", "corrupt_projection_with_ctf"])
@@ -1109,6 +1128,9 @@ def main():
                 latents_images = torch.from_numpy(latents_images)[:, None, ...]
                 writer.add_embedding(latents_intermediate, label_img=latents_images, tag="HetSIREN latent space", global_step=i)
 
+                # Save checkpoint model
+                NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "HetSIREN_CHECKPOINT"), epoch=i)
+
         hetsiren, optimizer = nnx.merge(graphdef, state)
 
         # Example of predicted data for Tensorboard
@@ -1118,8 +1140,9 @@ def main():
 
         # Save model
         NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN"), mode="pickle")
-        if args.vol is not None:
-            NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
+
+        # Remove checkpoint
+        shutil.rmtree(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"))
 
     elif args.mode == "predict":
 
