@@ -169,6 +169,7 @@ def main():
     import random
     import numpy as np
     import argparse
+    import shutil
     from xmipp_metadata.image_handler import ImageHandler
     import optax
     from hax.checkpointer import NeuralNetworkCheckpointer
@@ -274,9 +275,16 @@ def main():
         optimizer = nnx.Optimizer(imageAdjustment, optax.adam(args.learning_rate))
         graphdef, state = nnx.split((imageAdjustment, optimizer))
 
+        # Resume if checkpoint exists
+        if os.path.isdir(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT")):
+            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"))
+            print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
+        else:
+            resume_epoch = 0
+
         # Training loop
         print(f"{bcolors.OKCYAN}\n###### Training image adjustment... ######")
-        for i in range(args.epochs):
+        for i in range(resume_epoch, args.epochs):
             total_loss = 0
 
             # For progress bar (TQDM)
@@ -299,10 +307,18 @@ def main():
                                       i * len(data_loader) + step)
 
                 step += 1
+
+            if i % 5:
+                # Save checkpoint model
+                NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"), epoch=i)
+
         imageAdjustment, optimizer = nnx.merge(graphdef, state)
 
         # Save model
         NeuralNetworkCheckpointer.save(imageAdjustment, os.path.join(args.output_path, "imageAdjustment"), mode="pickle")
+
+        # Remove checkpoint
+        shutil.rmtree(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"))
 
     elif args.mode == "predict":
 
