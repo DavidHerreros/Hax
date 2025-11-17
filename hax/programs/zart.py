@@ -30,7 +30,7 @@ class DeltaVolume(nnx.Module):
         coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)[None, ...]
         self.coords = (coords - self.factor) / self.factor
 
-        # Learnable parameters FIXME: Use real random key
+        # Learnable parameters (keep this in case it is useful in the future)
         # if self.num_maps == 1:
         #     self.params = nnx.Param(initializer(jax.random.key(0), (1, total_voxels * 4,), jnp.float32))
         # else:
@@ -50,6 +50,7 @@ class DeltaVolume(nnx.Module):
                            Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs)]
 
     def __call__(self):
+        # (keep this in case it is useful in the future)
         # if self.num_maps == 2:
         #     params = jnp.concatenate(self.params, axis=0)
         # else:
