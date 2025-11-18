@@ -529,6 +529,15 @@ class HetSIREN(nnx.Module):
 
         return self.delta_volume_decoder.decode_volume(x=x, filter=True)
 
+    def decode_field(self, x):
+        if x.ndim == 4:
+            x, _ = self(x)
+
+        coords, _ = self.delta_volume_decoder(x)
+
+        return (coords - self.delta_volume_decoder.factor * self.delta_volume_decoder.coords,
+                self.delta_volume_decoder.factor * self.delta_volume_decoder.coords)
+
 
 @jax.jit
 def train_step_hetsiren(graphdef, state, x, labels, md, key):
