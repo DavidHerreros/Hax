@@ -529,6 +529,15 @@ class HetSIREN(nnx.Module):
 
         return self.delta_volume_decoder.decode_volume(x=x, filter=True)
 
+    def decode_field(self, x):
+        if x.ndim == 4:
+            x, _ = self(x)
+
+        coords, _ = self.delta_volume_decoder(x)
+
+        return (coords - self.delta_volume_decoder.factor * self.delta_volume_decoder.coords,
+                self.delta_volume_decoder.factor * self.delta_volume_decoder.coords)
+
 
 @jax.jit
 def train_step_hetsiren(graphdef, state, x, labels, md, key):
@@ -589,10 +598,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
 
         # Sample new rotations
         if M > 1:
-            rotations_rigid, omegas, log_q = sample_topM_R(rot_sample_key, rotations_rigid, rotations_logscale, M=M)
-
             # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
-            rotations_refined = jnp.matmul(rotations[:, None, ...], rotations_rigid)
+            rotations_refined = jnp.matmul(rotations, rotations_rigid)
+
+            rotations_refined, omegas, log_q = sample_topM_R(rot_sample_key, rotations_refined, rotations_logscale, M=M)
         else:
             # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
             rotations_refined = jnp.matmul(rotations, rotations_rigid)
@@ -651,14 +660,13 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
 
         # recon_loss = dm_pix.mae(images_corrected_loss[..., None], x_loss[..., None]).mean()
         recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None])
-        recon_loss_rigid = 0.5 * (mse(images_rigid_loss[..., None], x_loss[..., None]) + mse(images_rigid_loss[..., None], images_corrected_loss[..., None]))
+        recon_loss_rigid_1 = mse(images_rigid_loss[..., None], x_loss[..., None])
+        recon_loss_rigid_2 = mse(images_rigid_loss[..., None], images_corrected_loss[..., None])
+        recon_loss_rigid = 0.5 * (recon_loss_rigid_1 + recon_loss_rigid_2)
         recons_loss_all = 0.5 * (recon_loss + recon_loss_rigid)
 
         # L1 based denoising
-        if not model.delta_volume_decoder.transport_mass:
-            l1_loss = jnp.mean(jnp.abs(values))
-        else:
-            l1_loss = 0.0
+        l1_loss = jnp.mean(jnp.abs(values))
 
         # L1 and L2 total variation
         # diff_x = volumes[:, 1:, :, :] - volumes[:, :-1, :, :]
@@ -702,7 +710,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
                 rotations_random_matrix = euler_matrix_batch(rotations_random[:, 0], rotations_random[:, 1], rotations_random[:, 2])
                 if M > 1:
                     images_corrected = images_corrected[:, 0, ...]
-                    rotations_random_refined = jnp.matmul(rotations_random_matrix, rotations_rigid[:, 0, ...])
+                    rotations_random_refined = jnp.matmul(rotations_random_matrix, rotations_rigid)
                 else:
                     rotations_random_refined = jnp.matmul(rotations_random_matrix, rotations_rigid)
                 shifts_random_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations_random_matrix, "b m n -> b n m"))[:, 0, :2]
@@ -734,7 +742,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
             decoupling_loss = 0.0
 
         loss = (nll + 0.0001 * kl_loss + 0.001 * kl_pose + 0.001 * decoupling_loss
-                + 0.01 * l1_loss  + 0.01 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss)
+                + 0.001 * l1_loss  + 0.001 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
@@ -792,6 +800,116 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
     return loss, recon_loss, state, key
 
 
+@jax.jit
+def validation_step_hetsiren(graphdef, state, x, labels, md, key):
+    model, optimizer = nnx.merge(graphdef, state)
+
+    def loss_fn(model, x):
+        # Check if Tomo mode
+        if model.isTomoSIREN:
+            (x, subtomogram_label) = x
+
+        # Encode latent E(z)
+        if model.isVae:
+            if model.decoupling:
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+            elif model.isTomoSIREN:
+                (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+                (_, latent_1, _), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+            else:
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x, return_alignment_refinement=True)
+        else:
+            if model.decoupling:
+                latent, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+            elif model.isTomoSIREN:
+                latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+                latent_1, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+            else:
+                latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x, return_alignment_refinement=True)
+
+        # Decode volumes
+        if model.isVae:
+            coords, values = model.delta_volume_decoder(sample)
+        else:
+            coords, values = model.delta_volume_decoder(latent)
+
+        # Get rotation matrices
+        if euler_angles.ndim == 2:
+            rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
+        else:
+            rotations = euler_angles
+
+        # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
+        rotations_refined = jnp.matmul(rotations, rotations_rigid)
+        shifts_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
+
+        # Generate projections
+        images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+
+        # Project "mask"
+        if not model.delta_volume_decoder.transport_mass:
+            projected_mask = model.phys_decoder(x, jnp.ones_like(values), coords, model.xsize,  rotations_refined, shifts_refined, ctf, None, False)
+        else:
+            projected_mask = jnp.ones_like(x)[..., 0]
+
+        # Losses
+        images_corrected = jnp.squeeze(images_corrected)
+        x = jnp.squeeze(x)
+
+        # Consider CTF if Wiener mode (only for loss)
+        if model.ctf_type == "wiener":
+            x_loss = wiener2DFilter(x, ctf, pad_factor=2)
+            images_corrected_loss = wiener2DFilter(images_corrected, ctf, 2)
+        elif model.ctf_type == "squared":
+            x_loss = ctfFilter(x, ctf, pad_factor=2)
+            images_corrected_loss = ctfFilter(images_corrected, ctf, 2)
+        else:
+            x_loss = x
+            images_corrected_loss = images_corrected
+
+        # Projection mask
+        x_loss = x_loss * projected_mask
+        images_corrected_loss = images_corrected_loss * projected_mask
+
+        recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
+
+        return recon_loss
+
+    # Check if Tomo mode
+    if model.isTomoSIREN:
+        (x, subtomogram_label) = x
+
+    # Precompute batch aligments
+    euler_angles = md["euler_angles"][labels]
+
+    # Precompute batch shifts
+    shifts = md["shifts"][labels]
+
+    # Precompute batch CTFs
+    if model.ctf_type is not None:
+        defocusU = md["ctfDefocusU"][labels]
+        defocusV = md["ctfDefocusV"][labels]
+        defocusAngle = md["ctfDefocusAngle"][labels]
+        cs = md["ctfSphericalAberration"][labels]
+        kv = md["ctfVoltage"][labels][0]
+        ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                         model.sr, [2 * model.xsize, int(2 * 0.5 * model.xsize + 1)],
+                         x.shape[0], True)
+    else:
+        ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
+
+    if model.ctf_type == "precorrect":
+        # Wiener filter
+        x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+
+    if model.isTomoSIREN:
+        loss = loss_fn(model, (x, subtomogram_label))
+    else:
+        loss = loss_fn(model, x)
+
+    return loss
+
+
 
 
 def main():
@@ -810,6 +928,10 @@ def main():
     from hax.networks import train_step_hetsiren
     from hax.metrics import JaxSummaryWriter
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
+    from hax.schedulers import CosineAnnealingScheduler
+
+    def list_of_floats(arg):
+        return list(map(float, arg.split(',')))
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
@@ -860,6 +982,11 @@ def main():
                              f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
                              f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
                              f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
+    parser.add_argument("-dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
+                        help=f"Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: {bcolors.ITALIC}training_fraction{bcolors.ENDC},"
+                             f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC}. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the "
+                             f"accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. {bcolors.WARNING}NOTE{bcolors.ENDC}: the sum of "
+                             f"{bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} must be equal to one.")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the results (trained neural network, new metadata...)")
     parser.add_argument("--reload", required=False, type=str,
@@ -871,6 +998,11 @@ def main():
     # Manually handed parameters
     local_reconstruction = args.local_reconstruction
     transport_mass = args.transport_mass if not local_reconstruction else False
+
+    # Check that training and validation fractions add up to one
+    if sum(args.dataset_split_fraction) != 1:
+        raise ValueError(f"The sum of {bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} is not equal one. Please, update the values "
+                         f"to fulfill this requirement.")
 
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
@@ -947,8 +1079,8 @@ def main():
         writer = JaxSummaryWriter(os.path.join(args.output_path, "HetSIREN_metrics"))
 
         # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
-                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
+        data_loader_full, data_loader, data_loader_validation  = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
+                                                                                             mmap=mmap, mmap_output_dir=mmap_output_dir, split_fraction=args.dataset_split_fraction)
 
         # Example of training data for Tensorboard
         if hetsiren.isTomoSIREN:
@@ -971,58 +1103,73 @@ def main():
         writer.add_text("Projector warning", legend_projector)
 
         if args.vol is not None:
-            # Optimizers (Volume Adjustment)
-            optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
-            graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
+            if not os.path.isdir(os.path.join(args.output_path, "HetSIREN_CHECKPOINT")):
+                # Optimizers (Volume Adjustment)
+                optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
+                graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
 
-            # Number epochs (volume adjustment)
-            if len(generator.md) >= 10000:
-                num_epochs_vol = 20
-            else:
-                num_epochs_vol = 200
+                # Number epochs (volume adjustment)
+                if len(generator.md) >= 10000:
+                    num_epochs_vol = 20
+                else:
+                    num_epochs_vol = 200
 
-            # Training loop (Volume Adjustment)
-            print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
-            for i in range(num_epochs_vol):
-                total_loss = 0
+                # Training loop (Volume Adjustment)
+                print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
+                for i in range(num_epochs_vol):
+                    total_loss = 0
 
-                # For progress bar (TQDM)
-                step = 1
-                print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
-                pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
-                            colour="green")
+                    # For progress bar (TQDM)
+                    step = 1
+                    print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
+                    pbar = tqdm(data_loader_full, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
+                                colour="green")
 
-                for (x, labels) in pbar:
-                    if isinstance(x, tuple):
-                        x = x[0]
+                    for (x, labels) in pbar:
+                        if isinstance(x, tuple):
+                            x = x[0]
 
-                    loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
-                                                               args.ctf_type, vol.shape[0])
-                    total_loss += loss
+                        loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
+                                                                   args.ctf_type, vol.shape[0])
+                        total_loss += loss
 
-                    # Progress bar update  (TQDM)
-                    pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+                        # Progress bar update  (TQDM)
+                        pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
-                    # Summary writer (training loss)
-                    if step % int(np.ceil(0.1 * len(data_loader))) == 0:
-                        writer.add_scalar('Training loss (volume adjustment)',
-                                          total_loss / step,
-                                          i * len(data_loader) + step)
+                        # Summary writer (training loss)
+                        if step % int(np.ceil(0.1 * len(data_loader_full))) == 0:
+                            writer.add_scalar('Training loss (volume adjustment)',
+                                              total_loss / step,
+                                              i * len(data_loader_full) + step)
 
-                    step += 1
+                        step += 1
 
-            volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
-            values = volumeAdjustment()
+                volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
+                values = volumeAdjustment()
 
-            # Place values on grid and replace HetSIREN reference volume
-            grid = jnp.zeros_like(vol)
-            grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
-            hetsiren.reference_volume = grid
-            hetsiren.delta_volume_decoder.reference_values = values
+                # Place values on grid and replace HetSIREN reference volume
+                grid = jnp.zeros_like(vol)
+                grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
+                hetsiren.reference_volume = grid
+                hetsiren.delta_volume_decoder.reference_values = values
+
+                # Save model
+                NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
+
+        # Learning rate scheduler
+        total_steps = args.epochs * len(data_loader)
+        lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=args.learning_rate, total_steps=total_steps, warmup_frac=0.1, end_value=0.0, init_value=1e-5)
 
         # Optimizers (HetSIREN)
-        optimizer = nnx.Optimizer(hetsiren, optax.adam(args.learning_rate))
+        optimizer = nnx.Optimizer(hetsiren, optax.adam(lr_schedule))
         graphdef, state = nnx.split((hetsiren, optimizer))
+
+        # Resume if checkpoint exists
+        if os.path.isdir(os.path.join(args.output_path, "HetSIREN_CHECKPOINT")):
+            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"))
+            print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
+        else:
+            resume_epoch = 0
 
         # Jitted functions to improve performance
         @partial(jax.jit, static_argnames=["ctf_type", "return_latent", "corrupt_projection_with_ctf"])
@@ -1040,12 +1187,14 @@ def main():
 
         # Training loop (HetSIREN)
         print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
-        for i in range(args.epochs):
+        for i in range(resume_epoch, args.epochs):
             total_loss = 0
             total_recon_loss = 0
+            total_validation_loss = 0
 
             # For progress bar (TQDM)
             step = 1
+            step_validation = 1
             print(f'\nTraining epoch {i + 1}/{args.epochs} |')
             pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
 
@@ -1063,9 +1212,24 @@ def main():
                                       total_loss / step,
                                       i * len(data_loader) + step)
 
-                    writer.add_scalar('Reconstruction loss (HetSIREN)',
-                                      total_recon_loss / step,
-                                      i * len(data_loader) + step)
+                    writer.add_scalars('Reconstruction loss (HetSIREN)',
+                                       {"train": total_recon_loss / step},
+                                        i * len(data_loader) + step)
+
+                # Summary writer (validation loss)
+                if step % int(np.ceil(0.5 * len(data_loader))) == 0:
+                    # Run validation step
+                    print(f"\n{bcolors.WARNING}Running validation step...{bcolors.ENDC}\n")
+                    for (x_validation, labels_validation) in data_loader_validation:
+                        loss_validation = validation_step_hetsiren(graphdef, state, x_validation, labels_validation, md_columns, rng)
+                        total_validation_loss += loss_validation
+
+                        step_validation += 1
+
+                    writer.add_scalars('Reconstruction loss (HetSIREN)',
+                                       {"validation": total_validation_loss / step_validation},
+                                       i * len(data_loader) + step)
+
                 step += 1
 
             # Log intermediate results at the end of the epoch
@@ -1109,6 +1273,9 @@ def main():
                 latents_images = torch.from_numpy(latents_images)[:, None, ...]
                 writer.add_embedding(latents_intermediate, label_img=latents_images, tag="HetSIREN latent space", global_step=i)
 
+                # Save checkpoint model
+                NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "HetSIREN_CHECKPOINT"), epoch=i)
+
         hetsiren, optimizer = nnx.merge(graphdef, state)
 
         # Example of predicted data for Tensorboard
@@ -1118,8 +1285,9 @@ def main():
 
         # Save model
         NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN"), mode="pickle")
-        if args.vol is not None:
-            NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
+
+        # Remove checkpoint
+        shutil.rmtree(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"))
 
     elif args.mode == "predict":
 
