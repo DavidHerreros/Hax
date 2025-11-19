@@ -407,9 +407,8 @@ def main():
                     # Run validation step
                     print(f"\n{bcolors.WARNING}Running validation step...{bcolors.ENDC}\n")
                     for (x_validation, labels_validation) in data_loader_validation:
-                        loss_validation = validation_step_volume_adjustment(graphdef, state, x_validation,
-                                                                            labels_validation,
-                                                                            md_columns, rng)
+                        loss_validation = validation_step_volume_adjustment(graphdef, state, x_validation, labels_validation,
+                                                                            md_columns, args.sr, args.ctf_type, vol.shape[0])
                         total_validation_loss += loss_validation
 
                         step_validation += 1
