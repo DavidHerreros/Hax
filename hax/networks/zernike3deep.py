@@ -109,10 +109,53 @@ class Encoder(nnx.Module):
                 latent = self.latent(x)
                 return latent
 
-class MultiEncoder(nnx.Module):
+class EncoderTomo(nnx.Module):
     def __init__(self, input_dim, lat_dim=10, n_layers=3, isVae=False, *, rngs: nnx.Rngs):
-        self.encoders = {"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, rngs=rngs),
-                         "encoder_dec": Encoder(input_dim, lat_dim, n_layers=n_layers, rngs=rngs)}
+        self.input_dim = input_dim
+        self.isVae = isVae
+        self.normal_key = rngs.distributions()
+
+        self.hidden_layers = [Linear(self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        for _ in range(n_layers):
+            self.hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers.append(Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
+        for _ in range(2):
+            self.hidden_layers.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+        self.latent = Linear(256, lat_dim, rngs=rngs)
+
+        if isVae:
+            self.mean_x = Linear(256, lat_dim, rngs=rngs)
+            self.logstd_x = Linear(256, lat_dim, rngs=rngs)
+        else:
+            self.latent = Linear(256, lat_dim, rngs=rngs)
+
+    def sample_gaussian(self, mean, logstd):
+        return logstd * jnr.normal(self.normal_key, shape=mean.shape) + mean
+
+    def __call__(self, x, return_last=False):
+        for layer in self.hidden_layers:
+            x = nnx.relu(layer(x))
+
+        if return_last:
+            return x
+        else:
+            if self.isVae:
+                mean = self.mean_x(x)
+                logstd = self.logstd_x(x)
+                sample = self.sample_gaussian(mean, logstd)
+                return sample, mean, logstd
+            else:
+                latent = self.latent(x)
+                return latent
+
+class MultiEncoder(nnx.Module):
+    def __init__(self, input_dim, lat_dim=10, n_layers=3, isVae=False, isTomo=False, *, rngs: nnx.Rngs):
+        if isTomo:
+            self.encoders = {"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, rngs=rngs),
+                             "encoder_dec": EncoderTomo(100, lat_dim, n_layers=n_layers, rngs=rngs)}
+        else:
+            self.encoders = {"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, rngs=rngs),
+                             "encoder_dec": Encoder(input_dim, lat_dim, n_layers=n_layers, rngs=rngs)}
         self.normal_key = rngs.distributions()
         self.isVae = isVae
         if isVae:
@@ -283,25 +326,23 @@ class PhysDecoder(nnx.Module):
         # Gaussian filter (needed by forward interpolation)
         images = dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3)[..., 0]
 
+        # Apply CTF
+        if ctf_type in ["apply", "wiener", "squared"]:
+            images = ctfFilter(images, ctf, pad_factor=2)
+
         # Gray level adjustment
         x_nc = jnp.squeeze(x)
         if x_nc.ndim == 2:
             x_nc = x_nc[None, ...]
         a, b = self.imageAdjustment(x_nc)
         if a.ndim == 1:
-            images = a[:, None, None] * images + b[:, None, None]
-        else:
-            images = a * images + b
+            a, b = a[:, None, None], b[:, None, None]
 
-        # Apply CTF
-        if ctf_type in ["apply", "wiener", "squared"]:
-            images = ctfFilter(images, ctf, pad_factor=2)
-
-        return images
+        return images, (a, b)
 
 class Zernike3Deep(nnx.Module):
     def __init__(self, lat_dim, total_voxels, inds, values, xsize, sr, bank_size=10000, ctf_type="apply", diff_geo=False,
-                 second_derivative=False, decoupling=False, isVae=False, L1=7, L2=7, *, rngs: nnx.Rngs):
+                 second_derivative=False, decoupling=False, isVae=False, L1=7, L2=7, isTomo=False, *, rngs: nnx.Rngs):
         super(Zernike3Deep, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -309,9 +350,10 @@ class Zernike3Deep(nnx.Module):
         self.inds = jnp.array(inds)
         self.coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1) - 0.5 * self.xsize
         self.values = jnp.array(values)
-        self.decoupling = decoupling
+        self.decoupling = decoupling if not isTomo else False
+        self.isTomo = isTomo
         self.isVae = isVae
-        self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, rngs=rngs) if decoupling else Encoder(self.xsize, lat_dim, isVae=isVae, rngs=rngs)
+        self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, rngs=rngs, isTomo=isTomo) if decoupling or isTomo else Encoder(self.xsize, lat_dim, isVae=isVae, rngs=rngs)
         self.flow_decoder = FlowDecoder(lat_dim, total_voxels, self.coords, 0.5 * self.xsize, diff_geo=diff_geo,
                                         second_derivative=second_derivative, choice_key=rngs.choice(), L1=L1, L2=L2, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize, lat_dim=lat_dim, rngs=rngs)
@@ -406,7 +448,7 @@ class Zernike3Deep(nnx.Module):
             ctf_type = None
 
         # Generate projections
-        images_corrected = self.phys_decoder(flow, x, self.inds, self.values, self.xsize, euler_angles, shifts, ctf, ctf_type)
+        images_corrected, _ = self.phys_decoder(flow, x, self.inds, self.values, self.xsize, euler_angles, shifts, ctf, ctf_type)
 
         if return_latent:
             return images_corrected, latent
@@ -438,16 +480,28 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
     model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
     distributions_key, key = jax.random.split(key)
 
-    def loss_fn_ot(model, x):
+    sw_sorted_differentiable_batch = jax.vmap(sw_sorted_differentiable_images, in_axes=(0, 0, None, None, None))
+
+    def loss_fn(model, x):
+        # Check if Tomo mode
+        if model.isTomo:
+            (x, subtomogram_label) = x
+
         # Encode latent E(z)
         if model.isVae:
             if model.decoupling:
                 (sample, latent, logstd), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True)
+            elif model.isTomo:
+                (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+                (_, latent_1, _), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True)
             else:
                 sample, latent, logstd = model.encoder(x)
         else:
             if model.decoupling:
                 latent, prev_layer_out = model.encoder(x, "encoder_exp", return_last=True)
+            elif model.isTomo:
+                latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+                latent_1, prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True)
             else:
                 latent = model.encoder(x)
 
@@ -458,7 +512,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
             flow, jac_loss, be_loss, coefficient_loss = model.flow_decoder(latent, model.inds, model.xsize)
 
         # Generate projections
-        images_corrected = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, euler_angles, shifts, ctf, model.ctf_type)
+        images_corrected, (a, b) = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, euler_angles, shifts, ctf, model.ctf_type)
 
         # Losses
         images_corrected = jnp.squeeze(images_corrected)
@@ -472,7 +526,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
             x_loss = ctfFilter(x, ctf, pad_factor=2)
             images_corrected_loss = ctfFilter(images_corrected, ctf, pad_factor=2)
         else:
-            x_loss = x
+            x_loss = a * x + b
             images_corrected_loss = images_corrected
 
         # # recon_loss = dm_pix.mae(images_corrected[..., None], x_corrected[..., None]).mean()
@@ -488,20 +542,24 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
             kl_loss = 0.0
 
         # Decoupling
-        if model.decoupling:
-            images_random = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, rotations_random,
-                                               shifts, ctf_random, model.ctf_type)
-            if model.isVae:
-                (_, latent_1, _), prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec",
-                                                                       return_last=True)
-                (_, latent_2, _) = model.encoder(images_random[..., None], "encoder_dec")
+        if model.decoupling or model.isTomo:
+            if not model.isTomo:
+                images_random, _ = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, rotations_random,
+                                                      shifts, ctf_random, model.ctf_type)
+                if model.isVae:
+                    (_, latent_1, _), prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec",
+                                                                           return_last=True)
+                    (_, latent_2, _) = model.encoder(images_random[..., None], "encoder_dec")
+                else:
+                    latent_1, prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec",
+                                                                   return_last=True)
+                    latent_2 = model.encoder(images_random[..., None], "encoder_dec")
+                decoupling_loss = (jnp.mean(jnp.square(latent - latent_1), axis=-1).mean() +
+                                   jnp.mean(jnp.square(latent - latent_2), axis=-1).mean() +
+                                   jnp.mean(jnp.square(prev_layer_out - prev_layer_out_random), axis=-1).mean())
             else:
-                latent_1, prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec",
-                                                               return_last=True)
-                latent_2 = model.encoder(images_random[..., None], "encoder_dec")
-            decoupling_loss = (jnp.mean(jnp.square(latent - latent_1), axis=-1).mean() +
-                               jnp.mean(jnp.square(latent - latent_2), axis=-1).mean() +
-                               jnp.mean(jnp.square(prev_layer_out - prev_layer_out_random), axis=-1).mean())
+                decoupling_loss = (jnp.mean(jnp.square(latent - latent_1), axis=-1).mean() +
+                                   jnp.mean(jnp.square(prev_layer_out - prev_layer_out_random), axis=-1).mean())
 
             random_indices = jnr.choice(model.choice_key, a=jnp.arange(model.bank_size), shape=(model.subset_size,),
                                         replace=False)
@@ -518,7 +576,11 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
             decoupling_loss = 0.0
 
         loss = recon_loss + 0.0001 * kl_loss + (jac_loss + be_loss) + 0.001 * decoupling_loss + 1e-4 * field_norm_loss
-        return loss, latent
+        return loss, (recon_loss, latent)
+
+    # Check if Tomo mode
+    if model.isTomo:
+        (x, subtomogram_label) = x
 
     params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('flow_decoder')))
     params_grays = nnx.All(nnx.Param, nnx.PathContains('phys_decoder'))
@@ -558,8 +620,11 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
     else:
         ctf_random = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
-    grad_fn_ot = nnx.value_and_grad(loss_fn_ot, argnums=nnx.DiffState(0, (params, params_grays)), has_aux=True)
-    (loss, latent), grads_combined = grad_fn_ot(model, x)
+    grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params, params_grays)), has_aux=True)
+    if model.isTomo:
+        (loss, (recon_loss, latent)), grads_combined = grad_fn(model, (x, subtomogram_label))
+    else:
+        (loss, (recon_loss, latent)), grads_combined = grad_fn(model, x)
 
     grads, grads_gray = grads_combined.split(params, params_grays)
 
@@ -571,7 +636,95 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
 
     state = nnx.state((model, optimizer, optimizer_grays))
 
-    return loss, state, key
+    return loss, recon_loss, state, key
+
+
+@jax.jit
+def validation_step_zernike3deep(graphdef, state, x, labels, md):
+    model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
+
+    def loss_fn(model, x):
+        # Check if Tomo mode
+        if model.isTomo:
+            (x, subtomogram_label) = x
+
+        # Encode latent E(z)
+        if model.isVae:
+            if model.decoupling:
+                (sample, latent, logstd), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True)
+            elif model.isTomo:
+                (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+            else:
+                sample, latent, logstd = model.encoder(x)
+        else:
+            if model.decoupling:
+                latent, prev_layer_out = model.encoder(x, "encoder_exp", return_last=True)
+            elif model.isTomo:
+                latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+            else:
+                latent = model.encoder(x)
+
+        # Decode flow field
+        if model.isVae:
+            flow, jac_loss, be_loss, coefficient_loss = model.flow_decoder(sample, model.inds, model.xsize)
+        else:
+            flow, jac_loss, be_loss, coefficient_loss = model.flow_decoder(latent, model.inds, model.xsize)
+
+        # Generate projections
+        images_corrected, (a, b) = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, euler_angles, shifts, ctf, model.ctf_type)
+
+        # Losses
+        images_corrected = jnp.squeeze(images_corrected)
+        x = jnp.squeeze(x)
+
+        # Consider CTF if Wiener or Squared mode (only for loss)
+        if model.ctf_type == "wiener":
+            x_loss = wiener2DFilter(x, ctf, pad_factor=2)
+            images_corrected_loss = wiener2DFilter(images_corrected, ctf, pad_factor=2)
+        elif model.ctf_type == "squared":
+            x_loss = ctfFilter(x, ctf, pad_factor=2)
+            images_corrected_loss = ctfFilter(images_corrected, ctf, pad_factor=2)
+        else:
+            x_loss = a * x + b
+            images_corrected_loss = images_corrected
+
+        recon_loss = dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
+
+        loss = recon_loss
+        return loss
+
+    # Check if Tomo mode
+    if model.isTomo:
+        (x, subtomogram_label) = x
+
+    # Precompute batch aligments
+    euler_angles = md["euler_angles"][labels]
+
+    # Precompute batch shifts
+    shifts = md["shifts"][labels]
+
+    # Precompute batch CTFs
+    if model.ctf_type is not None:
+        defocusU = md["ctfDefocusU"][labels]
+        defocusV = md["ctfDefocusV"][labels]
+        defocusAngle = md["ctfDefocusAngle"][labels]
+        cs = md["ctfSphericalAberration"][labels]
+        kv = md["ctfVoltage"][labels][0]
+        ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                         model.sr, [2 * model.xsize, int(2 * 0.5 * model.xsize + 1)],
+                         x.shape[0], True)
+    else:
+        ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
+
+    if model.ctf_type == "precorrect":
+        # Wiener filter
+        x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+
+    if model.isTomo:
+        loss = loss_fn(model, (x, subtomogram_label))
+    else:
+        loss = loss_fn(model, x)
+    return loss
 
 
 def main():
@@ -589,6 +742,10 @@ def main():
     from hax.generators import MetaDataGenerator, extract_columns, NumpyGenerator
     from hax.networks import train_step_zernike3deep, train_step_volume_adjustment, VolumeAdjustment
     from hax.metrics import JaxSummaryWriter
+    from hax.schedulers import CosineAnnealingScheduler
+
+    def list_of_floats(arg):
+        return list(map(float, arg.split(',')))
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
@@ -629,6 +786,11 @@ def main():
                              f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
                              f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
                              f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
+    parser.add_argument("-dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
+                        help=f"Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: {bcolors.ITALIC}training_fraction{bcolors.ENDC},"
+                             f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC}. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the "
+                             f"accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. {bcolors.WARNING}NOTE{bcolors.ENDC}: the sum of "
+                             f"{bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} must be equal to one.")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the results (trained neural network, new metadata...)")
     parser.add_argument("--reload", required=False, type=str,
@@ -636,6 +798,11 @@ def main():
                              f"{bcolors.WARNING}NOTE{bcolors.ENDC}: Since Zernike3Deep also learns a gray level adjustment, reload must be the path to a folder containing two additional "
                              f"folders called: {bcolors.UNDERLINE}Zernike3Deep{bcolors.ENDC} and {bcolors.UNDERLINE}volumeAdjustment{bcolors.ENDC})")
     args = parser.parse_args()
+
+    # Check that training and validation fractions add up to one
+    if sum(args.dataset_split_fraction) != 1:
+        raise ValueError(f"The sum of {bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} is not equal one. Please, update the values "
+                         f"to fulfill this requirement.")
 
     # Preprocess volume (and mask)
     vol = ImageHandler(args.vol).getData()
@@ -668,6 +835,9 @@ def main():
     generator = MetaDataGenerator(args.md)
     md_columns = extract_columns(generator.md)
 
+    # Check if Tomo is needed
+    isTomo = generator.mode == "tomo"
+
     # Random keys
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     rng, model_key, choice_key = jax.random.split(rng, 3)
@@ -675,7 +845,8 @@ def main():
     # Prepare network (Zernike3Deep)
     zernike3deep = Zernike3Deep(args.lat_dim, inds.shape[0], inds, values, vol.shape[0], args.sr,
                                 ctf_type=args.ctf_type, diff_geo=True, second_derivative=True, decoupling=True, isVae=True,
-                                L1=args.L1, L2=args.L2, bank_size=len(generator.md), rngs=nnx.Rngs(model_key, choice=choice_key))
+                                L1=args.L1, L2=args.L2, bank_size=len(generator.md), isTomo=isTomo,
+                                rngs=nnx.Rngs(model_key, choice=choice_key))
 
     # Prepare network (Volume Adjustment)
     volumeAdjustment = VolumeAdjustment(lat_dim=3, coords=coords, values=values, predicts_value=True, rngs=nnx.Rngs(model_key))
@@ -696,11 +867,14 @@ def main():
         writer = JaxSummaryWriter(os.path.join(args.output_path, "Zernike3Deep_metrics"))
 
         # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
-                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
+        data_loader_full, data_loader, data_loader_validation = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
+                                                                                            mmap=mmap, mmap_output_dir=mmap_output_dir, split_fraction=args.dataset_split_fraction)
 
         # Example of training data for Tensorboard
-        x_example, labels_example = next(iter(data_loader))
+        if zernike3deep.isTomo:
+            (x_example, _), labels_example = next(iter(data_loader))
+        else:
+            x_example, labels_example = next(iter(data_loader))
         x_example = jax.vmap(min_max_scale)(x_example)
         writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
@@ -716,51 +890,64 @@ def main():
                 """
         writer.add_text("Projector warning", legend_projector)
 
-        # Optimizers (Volume Adjustment)
-        optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
-        graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
+        if not os.path.isdir(os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT")):
+            # Optimizers (Volume Adjustment)
+            optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
+            graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
 
-        # Number epochs (volume adjustment)
-        if len(generator.md) >= 10000:
-            num_epochs_vol = 20
-        else:
-            num_epochs_vol = 200
+            # Number epochs (volume adjustment)
+            if len(generator.md) >= 10000:
+                num_epochs_vol = 20
+            else:
+                num_epochs_vol = 200
 
-        # Training loop (Volume Adjustment)
-        print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
-        for i in range(num_epochs_vol):
-            total_loss = 0
+            # Training loop (Volume Adjustment)
+            print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
+            for i in range(num_epochs_vol):
+                total_loss = 0
 
-            # For progress bar (TQDM)
-            step = 1
-            print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
-            pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
-                        colour="green")
+                # For progress bar (TQDM)
+                step = 1
+                print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
+                pbar = tqdm(data_loader_full, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
+                            colour="green")
 
-            for (x, labels) in pbar:
-                loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr, args.ctf_type, vol.shape[0])
-                total_loss += loss
+                for (x, labels) in pbar:
+                    loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr, args.ctf_type, vol.shape[0])
+                    total_loss += loss
 
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+                    # Progress bar update  (TQDM)
+                    pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
-                # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
-                    writer.add_scalar('Training loss (volume adjustment)',
-                                      total_loss / step,
-                                      i * len(data_loader) + step)
+                    # Summary writer (training loss)
+                    if step % int(np.ceil(0.1 * len(data_loader_full))) == 0:
+                        writer.add_scalar('Training loss (volume adjustment)',
+                                          total_loss / step,
+                                          i * len(data_loader_full) + step)
 
-                step += 1
+                    step += 1
 
-        volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
-        zernike3deep.values = volumeAdjustment()
+            volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
+            zernike3deep.values = volumeAdjustment()
+
+        # Learning rate scheduler
+        total_steps = args.epochs * len(data_loader)
+        lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=args.learning_rate, total_steps=total_steps,
+                                                            warmup_frac=0.1, end_value=0.0, init_value=1e-5)
 
         # Optimizers (Zernike3Deep)
         params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('flow_decoder')))
         params_grays = nnx.All(nnx.Param, nnx.PathContains('phys_decoder'))
-        optimizer = nnx.Optimizer(zernike3deep, optax.adam(args.learning_rate), wrt=params)
+        optimizer = nnx.Optimizer(zernike3deep, optax.adam(lr_schedule), wrt=params)
         optimizer_grays = nnx.Optimizer(zernike3deep, optax.adam(args.learning_rate), wrt=params_grays)  # TODO: Check if it is better to fix it to 1e-5 always
         graphdef, state = nnx.split((zernike3deep, optimizer, optimizer_grays))
+
+        # Resume if checkpoint exists
+        if os.path.isdir(os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT")):
+            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"))
+            print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
+        else:
+            resume_epoch = 0
 
         # Jitted functions to improve performance
         @partial(jax.jit, static_argnames=["ctf_type", "return_latent", "corrupt_projection_with_ctf"])
@@ -779,20 +966,24 @@ def main():
 
         # Training loop (Zernike3Deep)
         print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
-        for i in range(args.epochs):
+        for i in range(resume_epoch, args.epochs):
             total_loss = 0
+            total_recon_loss = 0
+            total_validation_loss = 0
 
             # For progress bar (TQDM)
             step = 1
+            step_validation = 1
             print(f'\nTraining epoch {i + 1}/{args.epochs} |')
             pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
 
             for (x, labels) in pbar:
-                loss, state, rng = train_step_zernike3deep(graphdef, state, x, labels, md_columns, rng)
+                loss, recon_loss, state, rng = train_step_zernike3deep(graphdef, state, x, labels, md_columns, rng)
                 total_loss += loss
+                total_recon_loss += recon_loss
 
                 # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
 
                 # Summary writer (training loss)
                 if step % int(np.ceil(0.1 * len(data_loader))) == 0:
@@ -801,6 +992,26 @@ def main():
                     writer.add_scalar('Training loss (Zernike3Deep)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
+
+                    writer.add_scalars('Image loss (Zernike3Deep)',
+                                       {"train": total_recon_loss / step},
+                                       i * len(data_loader) + step)
+
+                # Summary writer (validation loss)
+                if step % int(np.ceil(0.5 * len(data_loader))) == 0:
+                    # Run validation step
+                    print(f"\n{bcolors.WARNING}Running validation step...{bcolors.ENDC}\n")
+                    for (x_validation, labels_validation) in data_loader_validation:
+                        loss_validation = validation_step_zernike3deep(graphdef, state, x_validation, labels_validation,
+                                                                       md_columns)
+                        total_validation_loss += loss_validation
+
+                        step_validation += 1
+
+                    writer.add_scalars('Image loss (Zernike3Deep)',
+                                       {"validation": total_validation_loss / step_validation},
+                                       i * len(data_loader) + step)
+
                 step += 1
 
             # Log intermediate results at the end of the epoch
@@ -845,6 +1056,9 @@ def main():
                 latents_images = torch.from_numpy(latents_images)[:, None, ...]
                 writer.add_embedding(latents_intermediate, label_img=latents_images, tag="Zernike3Deep latent space", global_step=i)
 
+                # Save checkpoint model
+                NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT"), epoch=i)
+
         zernike3deep, optimizer, optimizer_grays = nnx.merge(graphdef, state)
 
         # Example of predicted data for Tensorboard
@@ -855,6 +1069,9 @@ def main():
         # Save model
         NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"))
         NeuralNetworkCheckpointer.save(zernike3deep, os.path.join(args.output_path, "Zernike3Deep"))
+
+        # Remove checkpoint
+        shutil.rmtree(os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT"))
 
     elif args.mode == "predict":
 
