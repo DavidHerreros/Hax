@@ -16,6 +16,10 @@ from hax.layers import *
 from hax.networks import ImageAdjustment
 
 
+def mse(a, b):
+    return jnp.mean(jnp.square(a - b), axis=(-3, -2, -1))
+
+
 class Encoder(nnx.Module):
     def __init__(self, input_dim, lat_dim=10, n_layers=3, architecture="convnn", isVae=False, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
@@ -164,26 +168,65 @@ class MultiEncoder(nnx.Module):
         else:
             self.latent = nnx.Linear(256, lat_dim, rngs=rngs)
 
+        # Hidden layer refinement
+        self.hidden_layers_refinement = [Linear(256, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        for _ in range(6):
+            self.hidden_layers_refinement.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+
+        # Rigid registration of volumes
+        self.rigid_6d_rotation = nnx.Linear(1024, 6, rngs=rngs)
+        self.rigid_shifts = nnx.Linear(1024, 3, rngs=rngs)
+
+        # Refinement control (residual learning)
+        self.alpha_rigid_rotations = nnx.Param(1e-4)
+        self.alpha_rigid_shifts = nnx.Param(1e-4)
+
     def sample_gaussian(self, mean, logstd):
         return logstd * jnr.normal(self.normal_key, shape=mean.shape) + mean
 
-    def __call__(self, x, encoder_id="encoder_exp", return_last=False):
+    def __call__(self, x, encoder_id="encoder_exp", return_last=False, return_alignment_refinement=False):
         x = self.encoders[encoder_id](x, return_last=True)
+
+        if return_alignment_refinement:
+            x_ref = nnx.relu(self.hidden_layers_refinement[0](x))
+            for layer in self.hidden_layers_refinement[1:]:
+                x_ref = nnx.relu(layer(x_ref))
+
+            # Estimate rotations for volume registration
+            rotations_6d = self.rigid_6d_rotation(x_ref)
+            identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
+            rotations_6d = identity_6d + self.alpha_rigid_rotations * rotations_6d
+            rotations_rigid = PoseDistMatrix.mode_rotmat(rotations_6d)
+
+            # Estimate shifts for volume registration
+            shifts_rigid = self.alpha_rigid_shifts * self.rigid_shifts(x_ref)
 
         if self.isVae:
             mean = self.mean_x(x)
             logstd = self.logstd_x(x)
             sample = self.sample_gaussian(mean, logstd)
             if return_last:
-                return [sample, mean, logstd], x
+                if return_alignment_refinement:
+                    return (sample, mean, logstd), (rotations_rigid, shifts_rigid), x
+                else:
+                    return (sample, mean, logstd), x
             else:
-                return sample, mean, logstd
+                if return_alignment_refinement:
+                    return (sample, mean, logstd), (rotations_rigid, shifts_rigid)
+                else:
+                    return sample, mean, logstd
         else:
             latent = self.latent(x)
             if return_last:
-                return latent, x
+                if return_alignment_refinement:
+                    return latent, (rotations_rigid, shifts_rigid), x
+                else:
+                    return latent, x
             else:
-                return latent
+                if return_alignment_refinement:
+                    return latent, (rotations_rigid, shifts_rigid)
+                else:
+                    return latent
 
 
 class FlowDecoder(nnx.Module):
@@ -373,19 +416,22 @@ class Zernike3Deep(nnx.Module):
     def __call__(self, x, **kwargs):
         if self.isVae:
             if self.decoupling:
-                sample, mean, _ = self.encoder(x, "encoder_exp", return_last=False)
+                (sample, mean, _), (rotations, shifts) = self.encoder(x, "encoder_exp", return_last=False, return_alignment_refinement=True)
             else:
-                sample, mean, _ = self.encoder(x, return_last=False)
+                (sample, mean, _), (rotations, shifts) = self.encoder(x, return_last=False, return_alignment_refinement=True)
             if kwargs.pop("gaussian_sample", False):
                 latent = sample
             else:
                 latent = mean
         else:
             if self.decoupling:
-                latent = self.encoder(x, "encoder_exp", return_last=False)
+                latent, (rotations, shifts) = self.encoder(x, "encoder_exp", return_last=False, return_alignment_refinement=True)
             else:
-                latent = self.encoder(x, return_last=False)
-        return latent
+                latent, (rotations, shifts) = self.encoder(x, return_last=False, return_alignment_refinement=True)
+        if kwargs.pop("return_alignment_refinement", True):
+            return latent, (rotations, shifts)
+        else:
+            return latent
 
     # --- Method for enqueuing to the memory bank ---
     def enqueue(self, keys_to_add):
@@ -436,19 +482,31 @@ class Zernike3Deep(nnx.Module):
                 x = wiener2DFilter(x[..., 0], ctf)[..., None]
 
             # Encode images
-            latent = self(x)
+            latent, (rotations_rigid, shifts_rigid) = self(x, return_alignment_refinement=True)
         else:
             latent = x
 
+        # Get rotation matrices
+        if euler_angles.ndim == 2:
+            rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
+        else:
+            rotations = euler_angles
+
         # Decode flow field
         flow, _, _, _ = self.flow_decoder(latent, self.inds, self.xsize)
+
+        # Consider alignments if needed
+        if x.ndim == 4:
+            # Consider refinement and rigid registration alignments
+            rotations = jnp.matmul(rotations, rotations_rigid)
+            shifts = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
 
         # Check if CTF corruption is needed
         if not corrupt_projection_with_ctf:
             ctf_type = None
 
         # Generate projections
-        images_corrected, _ = self.phys_decoder(flow, x, self.inds, self.values, self.xsize, euler_angles, shifts, ctf, ctf_type)
+        images_corrected, _ = self.phys_decoder(flow, x, self.inds, self.values, self.xsize, rotations, shifts, ctf, ctf_type)
 
         if return_latent:
             return images_corrected, latent
@@ -490,20 +548,20 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
         # Encode latent E(z)
         if model.isVae:
             if model.decoupling:
-                (sample, latent, logstd), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True)
-            elif model.isTomo:
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+            elif model.isTomoSIREN:
                 (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                (_, latent_1, _), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True)
+                (_, latent_1, _), (rotations_rigid, shifts_rigid), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
             else:
-                sample, latent, logstd = model.encoder(x)
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True)
         else:
             if model.decoupling:
-                latent, prev_layer_out = model.encoder(x, "encoder_exp", return_last=True)
-            elif model.isTomo:
+                latent, (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+            elif model.isTomoSIREN:
                 latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                latent_1, prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True)
+                latent_1, (rotations_rigid, shifts_rigid), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
             else:
-                latent = model.encoder(x)
+                latent, (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True)
 
         # Decode flow field
         if model.isVae:
@@ -511,26 +569,45 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
         else:
             flow, jac_loss, be_loss, coefficient_loss = model.flow_decoder(latent, model.inds, model.xsize)
 
+        # Get rotation matrices
+        if euler_angles.ndim == 2:
+            rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
+        else:
+            rotations = euler_angles
+
+        # Refine angular alignment
+        rotations_refined = jnp.matmul(rotations, rotations_rigid)
+        shifts_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
+
         # Generate projections
-        images_corrected, (a, b) = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, euler_angles, shifts, ctf, model.ctf_type)
+        images_corrected, (a, b) = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+        images_rigid, _ = model.phys_decoder(0.0, x, model.inds, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
 
         # Losses
         images_corrected = jnp.squeeze(images_corrected)
+        images_rigid = jnp.squeeze(images_rigid)
         x = jnp.squeeze(x)
 
         # Consider CTF if Wiener or Squared mode (only for loss)
         if model.ctf_type == "wiener":
             x_loss = wiener2DFilter(x, ctf, pad_factor=2)
             images_corrected_loss = wiener2DFilter(images_corrected, ctf, pad_factor=2)
+            images_rigid_loss = wiener2DFilter(images_rigid, ctf, pad_factor=2)
         elif model.ctf_type == "squared":
             x_loss = ctfFilter(x, ctf, pad_factor=2)
             images_corrected_loss = ctfFilter(images_corrected, ctf, pad_factor=2)
+            images_rigid_loss = ctfFilter(images_rigid, ctf, pad_factor=2)
         else:
             x_loss = a * x + b
             images_corrected_loss = images_corrected
+            images_rigid_loss = images_rigid
 
         # # recon_loss = dm_pix.mae(images_corrected[..., None], x_corrected[..., None]).mean()
         recon_loss = dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
+        recon_loss_rigid_1 = mse(images_rigid_loss[..., None], x_loss[..., None])
+        recon_loss_rigid_2 = mse(images_rigid_loss[..., None], images_corrected_loss[..., None])
+        recon_loss_rigid = 0.5 * (recon_loss_rigid_1.mean() + recon_loss_rigid_2.mean())
+        recons_loss_all = 0.5 * (recon_loss + recon_loss_rigid)
 
         # Field norm loss
         field_norm_loss = jnp.sqrt(jnp.square(flow).sum(axis=-1)).mean() / model.xsize
@@ -544,16 +621,18 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
         # Decoupling
         if model.decoupling or model.isTomo:
             if not model.isTomo:
-                images_random, _ = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, rotations_random,
-                                                      shifts, ctf_random, model.ctf_type)
+                rotations_random_matrix = euler_matrix_batch(rotations_random[:, 0], rotations_random[:, 1], rotations_random[:, 2])
+                shifts_random_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations_random_matrix, "b m n -> b n m"))[:, 0, :2]
+                images_random, _ = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, rotations_random_matrix,
+                                                      shifts_random_refined, ctf_random, model.ctf_type)
                 if model.isVae:
                     (_, latent_1, _), prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec",
-                                                                           return_last=True)
-                    (_, latent_2, _) = model.encoder(images_random[..., None], "encoder_dec")
+                                                                           return_last=True, return_alignment_refinement=False)
+                    (_, latent_2, _) = model.encoder(images_random[..., None], "encoder_dec", return_alignment_refinement=False)
                 else:
                     latent_1, prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec",
-                                                                   return_last=True)
-                    latent_2 = model.encoder(images_random[..., None], "encoder_dec")
+                                                                   return_last=True, return_alignment_refinement=False)
+                    latent_2 = model.encoder(images_random[..., None], "encoder_dec", return_alignment_refinement=False)
                 decoupling_loss = (jnp.mean(jnp.square(latent - latent_1), axis=-1).mean() +
                                    jnp.mean(jnp.square(latent - latent_2), axis=-1).mean() +
                                    jnp.mean(jnp.square(prev_layer_out - prev_layer_out_random), axis=-1).mean())
@@ -575,7 +654,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
         else:
             decoupling_loss = 0.0
 
-        loss = recon_loss + 0.0001 * kl_loss + (jac_loss + be_loss) + 0.001 * decoupling_loss + 1e-4 * field_norm_loss
+        loss = recons_loss_all + 0.0001 * kl_loss + (jac_loss + be_loss) + 0.001 * decoupling_loss + 1e-4 * field_norm_loss
         return loss, (recon_loss, latent)
 
     # Check if Tomo mode
@@ -648,21 +727,21 @@ def validation_step_zernike3deep(graphdef, state, x, labels, md):
         if model.isTomo:
             (x, subtomogram_label) = x
 
-        # Encode latent E(z)
-        if model.isVae:
-            if model.decoupling:
-                (sample, latent, logstd), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True)
-            elif model.isTomo:
-                (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+            # Encode latent E(z)
+            if model.isVae:
+                if model.decoupling:
+                    (sample, latent, logstd), (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+                elif model.isTomoSIREN:
+                    (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+                else:
+                    (sample, latent, logstd), (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True)
             else:
-                sample, latent, logstd = model.encoder(x)
-        else:
-            if model.decoupling:
-                latent, prev_layer_out = model.encoder(x, "encoder_exp", return_last=True)
-            elif model.isTomo:
-                latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-            else:
-                latent = model.encoder(x)
+                if model.decoupling:
+                    latent, (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+                elif model.isTomoSIREN:
+                    latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+                else:
+                    latent, (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True)
 
         # Decode flow field
         if model.isVae:
@@ -670,8 +749,18 @@ def validation_step_zernike3deep(graphdef, state, x, labels, md):
         else:
             flow, jac_loss, be_loss, coefficient_loss = model.flow_decoder(latent, model.inds, model.xsize)
 
+        # Get rotation matrices
+        if euler_angles.ndim == 2:
+            rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
+        else:
+            rotations = euler_angles
+
+        # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
+        rotations_refined = jnp.matmul(rotations, rotations_rigid)
+        shifts_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
+
         # Generate projections
-        images_corrected, (a, b) = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, euler_angles, shifts, ctf, model.ctf_type)
+        images_corrected, (a, b) = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
 
         # Losses
         images_corrected = jnp.squeeze(images_corrected)
@@ -1084,6 +1173,12 @@ def main():
         # Update zernike3deep values
         zernike3deep.values = volumeAdjustment()
 
+        # Rotations to Xmipp angles
+        euler_from_matrix_batch = jax.vmap(jax.jit(euler_from_matrix))
+
+        def xmippEulerFromMatrix(matrix):
+            return -jnp.rad2deg(euler_from_matrix_batch(matrix))
+
         # Prepare data loader
         data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False,
                                                   mmap=mmap, mmap_output_dir=mmap_output_dir)
@@ -1094,6 +1189,8 @@ def main():
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting Zernike3Deep latents... ######")
         latents = []
+        euler_angles = []
+        shifts = []
         for i in range(args.epochs):
             # For progress bar (TQDM)
             pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=",
@@ -1113,12 +1210,45 @@ def main():
                                      x.shape[0], True)
                     x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
-                latents.append(predict_fn(x))
+                latents_batch, (rotations_rigid, shifts_rigid) = predict_fn(x)
+
+                # Precompute batch aligments
+                rotations_batch = md_columns["euler_angles"][labels]
+
+                # Precompute batch shifts
+                shifts_batch = md_columns["shifts"][labels]
+
+                # Get rotation matrices
+                if rotations_batch.ndim == 2:
+                    rotations_batch = euler_matrix_batch(rotations_batch[:, 0], rotations_batch[:, 1],
+                                                         rotations_batch[:, 2])
+
+                # Consider refinement and rigid registration alignments
+                rotations_refined = jnp.matmul(rotations_batch, rotations_rigid)
+                shifts_refined = shifts_batch + jnp.matmul(shifts_rigid[:, None, :],
+                                                           rearrange(rotations_batch, "b m n -> b n m"))[:, 0, :2]
+
+                # Convert rotation to Euler angles in Xmipp format
+                euler_angles_refined = xmippEulerFromMatrix(rotations_refined)
+
+                # Convert to Numpy
+                euler_angles_refined, shifts_refined = np.array(euler_angles_refined), np.array(shifts_refined)
+
+                latents.append(latents_batch)
+                euler_angles.append(euler_angles_refined)
+                shifts.append(shifts_refined)
         latents = np.asarray(jnp.concatenate(latents, axis=0))
+        euler_angles = np.asarray(jnp.concatenate(euler_angles, axis=0))
+        shifts = np.asarray(jnp.concatenate(shifts, axis=0))
 
         # Save latents in metadata
         md = generator.md
         md[:, 'latent_space'] = np.asarray([",".join(np.char.mod('%f', item)) for item in latents])
+        md[:, 'angleRot'] = euler_angles[:, 0]
+        md[:, 'angleTilt'] = euler_angles[:, 1]
+        md[:, 'anglePsi'] = euler_angles[:, 2]
+        md[:, 'shiftX'] = shifts[:, 0]
+        md[:, 'shiftY'] = shifts[:, 1]
         md.write(os.path.join(args.output_path, "predicted_latents" +  os.path.splitext(args.md)[1]))
 
     elif args.mode == "send_to_pickle":
