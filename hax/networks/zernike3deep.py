@@ -248,9 +248,9 @@ class FlowDecoder(nnx.Module):
         self.hidden_layers_coeff = [Linear(latent_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         for _ in range(3):
             self.hidden_layers_coeff.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.latent_x = Linear(1024, len(self.zernike_degrees), rngs=rngs, kernel_init=jax.nn.initializers.uniform(0.0001))
-        self.latent_y = Linear(1024, len(self.zernike_degrees), rngs=rngs, kernel_init=jax.nn.initializers.uniform(0.0001))
-        self.latent_z = Linear(1024, len(self.zernike_degrees), rngs=rngs, kernel_init=jax.nn.initializers.uniform(0.0001))
+        self.latent_x = Linear(1024, len(self.zernike_degrees), rngs=rngs, kernel_init=jax.nn.initializers.normal(0.0001))
+        self.latent_y = Linear(1024, len(self.zernike_degrees), rngs=rngs, kernel_init=jax.nn.initializers.normal(0.0001))
+        self.latent_z = Linear(1024, len(self.zernike_degrees), rngs=rngs, kernel_init=jax.nn.initializers.normal(0.0001))
 
     def decode_coefficients(self, x):
         x = nnx.relu(self.hidden_layers_coeff[0](x))
@@ -581,7 +581,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
 
         # Generate projections
         images_corrected, (a, b) = model.phys_decoder(flow, x, model.inds, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
-        images_rigid, _ = model.phys_decoder(0.0, x, model.inds, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+        images_rigid, _ = model.phys_decoder(jnp.zeros_like(flow), x, model.inds, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
 
         # Losses
         images_corrected = jnp.squeeze(images_corrected)
