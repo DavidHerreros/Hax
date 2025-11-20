@@ -127,7 +127,7 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
             images = ctfFilter(images, ctf * ctf, pad_factor=2)
 
         # Apply gray level correction
-        images = a * images + b
+        x = a * x + b
 
         # Loss
         loss = dm_pix.mse(images[..., None], x[..., None]).mean()
@@ -229,7 +229,7 @@ def validation_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_typ
             images = ctfFilter(images, ctf * ctf, pad_factor=2)
 
         # Apply gray level correction
-        images = a * images + b
+        x = a * x + b
 
         # Loss
         loss = dm_pix.mse(images[..., None], x[..., None]).mean()
@@ -476,12 +476,12 @@ def main():
 
             # Adjust shapes of a and b
             if imageAdjustment.predict_value:
-                adjustment_a.append(1. / a)
-                adjustment_b.append(-b / a)
+                adjustment_a.append(a)
+                adjustment_b.append(b)
                 a = a[:, None, None]
                 b = b[:, None, None]
 
-            adjustment = np.nan_to_num(np.asarray((x[..., 0] - b) / a), nan=0.0, posinf=0.0, neginf=0.0)
+            adjustment = np.asarray(a * x[..., 0] + b)
             imgs_adjusted.append(adjustment)
         imgs_adjusted = np.concatenate(imgs_adjusted, axis=0)
 
