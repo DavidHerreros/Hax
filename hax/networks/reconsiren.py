@@ -49,7 +49,7 @@ class Encoder(nnx.Module):
         self.hidden_9d_rotation.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         # self.hidden_9d_rotation.append(nnx.Linear(1024, 3, rngs=rngs))
         if refine_current_assignment:
-            self.hidden_9d_rotation.append(nnx.Linear(1024, self.num_components * 6, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros))
+            self.hidden_9d_rotation.append(nnx.Linear(1024, self.num_components * 6, rngs=rngs))
             self.alpha_rotations = nnx.Param(jnp.array(1e-4))
         else:
             self.hidden_9d_rotation.append(nnx.Linear(1024, self.num_components * 9, rngs=rngs))
@@ -59,7 +59,7 @@ class Encoder(nnx.Module):
         self.hidden_shifts.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         self.hidden_shifts.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         if refine_current_assignment:
-            self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros))
+            self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
             self.alpha_shifts = nnx.Param(jnp.array(1e-4))
         else:
             self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
