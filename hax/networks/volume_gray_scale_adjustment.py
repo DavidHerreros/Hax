@@ -28,8 +28,8 @@ class VolumeAdjustment(nnx.Module):
         for _ in range(2):
             self.hidden_layers_us.append(nnx.Linear(32, 32, rngs=rngs, dtype=jnp.bfloat16))
         self.latent = nnx.Linear(32, lat_dim, rngs=rngs)
-        self.a = nnx.Linear(32, out_dim, rngs=rngs, kernel_init=jax.nn.initializers.normal(stddev=0.001), bias_init=nnx.initializers.ones)
-        self.b = nnx.Linear(32, out_dim, rngs=rngs, kernel_init=jax.nn.initializers.normal(stddev=0.001))
+        self.a = nnx.Linear(32, out_dim, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=nnx.initializers.ones)
+        self.b = nnx.Linear(32, out_dim, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=nnx.initializers.zeros)
 
     def __call__(self, return_ab=False):
         coords = rearrange(self.coords, "(b c) d -> b (c d)", b=1)
