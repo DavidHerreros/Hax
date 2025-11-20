@@ -216,9 +216,6 @@ def validation_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_typ
         # Gaussian filter (needed by forward interpolation)
         images = dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3)[..., 0]
 
-        # Apply gray level correction
-        images = a * images + b
-
         # Prepare data for losses
         x = x[..., 0]
 
@@ -230,6 +227,9 @@ def validation_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_typ
         elif ctf_type == "squared":
             x = ctfFilter(x, ctf, pad_factor=2)
             images = ctfFilter(images, ctf * ctf, pad_factor=2)
+
+        # Apply gray level correction
+        images = a * images + b
 
         # Loss
         loss = dm_pix.mse(images[..., None], x[..., None]).mean()
