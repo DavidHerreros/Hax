@@ -247,27 +247,26 @@ class DeltaVolumeDecoder(nnx.Module):
         # self.hidden_linear.append(HyperLinear(in_features=8, out_features=8, in_hyper_features=8, hidden_hyper_features=8, rngs=rngs, dtype=jnp.bfloat16))
 
         self.hidden_linear = [Linear(in_features=lat_dim, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
-        for _ in range(3):
+        for _ in range(4):
             self.hidden_linear.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
-        self.hidden_linear.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
 
         if transport_mass:
-            self.hidden_linear.append(Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
+            self.hidden_coords_values = Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform())
         else:
-            self.hidden_linear.append(Linear(in_features=8, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
+            self.hidden_values = Linear(in_features=8, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform())
 
     def __call__(self, x):
         # Decode voxel values
         x = jnp.sin(30.0 * self.hidden_linear[0](x))
-        for layer in self.hidden_linear[1:-1]:
-            # x = jnp.sin(1.0 * (x + layer(x, x)))
+        for layer in self.hidden_linear[1:]:
             x = x + jnp.sin(1.0 * layer(x))
-        x_map = self.hidden_linear[-1](x)
 
         if self.transport_mass:
+            x = self.hidden_coords_values(x)
+
             # Extract delta_coords and values
-            x_map = jnp.reshape(x_map, (x_map.shape[0], self.total_voxels, 4))
-            delta_coords, delta_values = x_map[..., :3], x_map[..., 3]
+            x = jnp.reshape(x, (x.shape[0], self.total_voxels, 4))
+            delta_coords, delta_values = x[..., :3], x[..., 3]
 
             # Recover volume values
             values = nnx.relu(self.reference_values + delta_values)
@@ -275,6 +274,8 @@ class DeltaVolumeDecoder(nnx.Module):
             # Recover coords (non-normalized)
             coords = self.factor * (self.coords + delta_coords)
         else:
+            x_map = self.hidden_values(x)
+
             # Recover volume values
             values = self.reference_values + x_map
 
@@ -407,7 +408,7 @@ class HetSIREN(nnx.Module):
         self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, architecture=architecture, isTomoSIREN=isTomoSIREN, rngs=rngs) \
             if decoupling or isTomoSIREN else Encoder(self.xsize, lat_dim, isVae=isVae, architecture=architecture, rngs=rngs)
         self.delta_volume_decoder = DeltaVolumeDecoder(self.inds.shape[0], lat_dim, self.xsize, self.inds, reference_values, transport_mass=transport_mass, rngs=rngs)
-        self.delta_volume_decoder_rigid = DeltaVolumeDecoder(self.inds.shape[0], lat_dim, self.xsize, self.inds, reference_values, transport_mass=True, rngs=rngs)
+        self.delta_volume_decoder_rigid = DeltaVolumeDecoder(self.inds.shape[0], lat_dim, self.xsize, self.inds, reference_values, transport_mass=False, rngs=rngs)
 
         self.phys_decoder = PhysDecoder(self.xsize, transport_mass=transport_mass)
 
@@ -612,12 +613,13 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
         coords_reference, values_reference = model.delta_volume_decoder_rigid(input_rigid)
 
         # Generate projections
-        images_corrected = phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+        images_corrected = phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+        images_corrected_field = phys_decoder(x, model.delta_volume_decoder.reference_values, coords, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
         images_rigid = phys_decoder(x, values_reference, coords_reference, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
 
         # Project "mask"
         if not model.delta_volume_decoder.transport_mass:
-            projected_mask = phys_decoder(x, jnp.ones_like(values), coords, model.xsize,  rotations_refined, shifts_refined, ctf, None, False)
+            projected_mask = phys_decoder(x, jnp.ones_like(values), jax.lax.stop_gradient(coords), model.xsize,  rotations_refined, shifts_refined, ctf, None, False)
             projected_mask = jnp.where(projected_mask > 1, 1.0, projected_mask)
 
             projected_mask_rigid = phys_decoder(x, jnp.ones_like(values_reference), coords_reference, model.xsize, rotations_refined, shifts_refined, ctf, None, False)
@@ -633,6 +635,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
 
         # Losses
         images_corrected = jnp.squeeze(images_corrected)
+        images_corrected_field = jnp.squeeze(images_corrected_field)
         images_rigid = jnp.squeeze(images_rigid)
         x = jnp.squeeze(x)
 
@@ -640,14 +643,17 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
         if model.ctf_type == "wiener":
             x_loss = wiener2DFilter(x, ctf, pad_factor=2)
             images_corrected_loss = wiener2DFilter_vmap(images_corrected, ctf, 2)
+            images_corrected_field_loss = wiener2DFilter_vmap(images_corrected_field, ctf, 2)
             images_rigid_loss = wiener2DFilter_vmap(images_rigid, ctf, 2)
         elif model.ctf_type == "squared":
             x_loss = ctfFilter(x, ctf, pad_factor=2)
             images_corrected_loss = ctfFilter_vmap(images_corrected, ctf, 2)
+            images_corrected_field_loss = ctfFilter_vmap(images_corrected_field, ctf, 2)
             images_rigid_loss = ctfFilter_vmap(images_rigid, ctf, 2)
         else:
             x_loss = x
             images_corrected_loss = images_corrected
+            images_corrected_field_loss = images_corrected_field
             images_rigid_loss = images_rigid
 
         if M > 1:
@@ -656,10 +662,11 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
         # Projection mask
         x_loss = x_loss * projected_mask
         images_corrected_loss = images_corrected_loss * projected_mask
+        images_corrected_field_loss = images_corrected_field_loss * projected_mask
         images_rigid_loss = images_rigid_loss * projected_mask_rigid
 
         # recon_loss = dm_pix.mae(images_corrected_loss[..., None], x_loss[..., None]).mean()
-        recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None])
+        recon_loss = 0.5 * (mse(images_corrected_loss[..., None], x_loss[..., None]) + mse(images_corrected_field_loss[..., None], x_loss[..., None]))
         recon_loss_rigid_1 = mse(images_rigid_loss[..., None], x_loss[..., None])
         recon_loss_rigid_2 = mse(images_rigid_loss[..., None], images_corrected_loss[..., None])
         recon_loss_rigid = 0.5 * (recon_loss_rigid_1 + recon_loss_rigid_2)
@@ -815,7 +822,6 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
                 (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
             elif model.isTomoSIREN:
                 (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                (_, latent_1, _), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
             else:
                 (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x, return_alignment_refinement=True)
         else:
@@ -823,7 +829,6 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
                 latent, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
             elif model.isTomoSIREN:
                 latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                latent_1, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
             else:
                 latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x, return_alignment_refinement=True)
 
