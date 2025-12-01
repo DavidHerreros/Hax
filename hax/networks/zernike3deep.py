@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 
-import random
 from functools import partial
 
 import jax
@@ -168,14 +167,19 @@ class MultiEncoder(nnx.Module):
         else:
             self.latent = nnx.Linear(256, lat_dim, rngs=rngs)
 
+        # Hidden layers latent space
+        self.hidden_layers_latent = [Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16)]
+        for _ in range(2):
+            self.hidden_layers_latent.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+
         # Hidden layer refinement
-        self.hidden_layers_refinement = [Linear(256, 1024, rngs=rngs, dtype=jnp.bfloat16)]
-        for _ in range(6):
-            self.hidden_layers_refinement.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_refinement = [Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16)]
+        for _ in range(2):
+            self.hidden_layers_refinement.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
 
         # Rigid registration of volumes
-        self.rigid_6d_rotation = nnx.Linear(1024, 6, rngs=rngs)
-        self.rigid_shifts = nnx.Linear(1024, 3, rngs=rngs)
+        self.rigid_6d_rotation = nnx.Linear(256, 6, rngs=rngs)
+        self.rigid_shifts = nnx.Linear(256, 3, rngs=rngs)
 
         # Refinement control (residual learning)
         self.alpha_rigid_rotations = nnx.Param(1e-4)
@@ -188,9 +192,9 @@ class MultiEncoder(nnx.Module):
         x = self.encoders[encoder_id](x, return_last=True)
 
         if return_alignment_refinement:
-            x_ref = nnx.relu(self.hidden_layers_refinement[0](x))
+            x_ref = nnx.relu(x + self.hidden_layers_refinement[0](x))
             for layer in self.hidden_layers_refinement[1:]:
-                x_ref = nnx.relu(layer(x_ref))
+                x_ref = nnx.relu(x_ref + layer(x_ref))
 
             # Estimate rotations for volume registration
             rotations_6d = self.rigid_6d_rotation(x_ref)
@@ -200,6 +204,9 @@ class MultiEncoder(nnx.Module):
 
             # Estimate shifts for volume registration
             shifts_rigid = self.alpha_rigid_shifts * self.rigid_shifts(x_ref)
+
+        for layer in self.hidden_layers_latent:
+            x = nnx.relu(x + layer(x))
 
         if self.isVae:
             mean = self.mean_x(x)
@@ -230,13 +237,10 @@ class MultiEncoder(nnx.Module):
 
 
 class FlowDecoder(nnx.Module):
-    def __init__(self, latent_dim, total_voxels, coords, factor, choice_key, diff_geo=False, second_derivative=False, L1=7, L2=7,
-                 *, rngs: nnx.Rngs):
+    def __init__(self, latent_dim, total_voxels, coords, factor, choice_key, L1=7, L2=7, *, rngs: nnx.Rngs):
         self.coords = coords
         self.factor = factor
         self.total_voxels = total_voxels
-        self.diff_geo = diff_geo
-        self.second_derivative = second_derivative
         self.choice_key = choice_key
 
         # Precompute Zernike3D basis
@@ -274,49 +278,7 @@ class FlowDecoder(nnx.Module):
         flow = factor * jnp.stack([d_x, d_y, d_z], axis=-1)
         # flow = jnp.stack([d_x, d_y, d_z], axis=-1)
 
-        #### Differential geometry losses ####
-        if self.diff_geo:
-            def compute_gradients(coords):
-                Z = computeBasis(coords, degrees=self.zernike_degrees, r=factor, groups=None, centers=None,
-                                 sph_coeffs=self.sph_coeffs, zernike_coeffs=self.zernike_coeffs)
-                d_x = jnp.matmul(latent_x, Z)
-                d_y = jnp.matmul(latent_y, Z)
-                d_z = jnp.matmul(latent_z, Z)
-                return jnp.stack([d_x, d_y, d_z], axis=-1)
-
-            coords_subset = jnr.choice(self.choice_key, coords, shape=(1000,), replace=False)  # Is it better to use shape=(10000,)?
-            jacobian_for_single_point = jax.jacfwd(compute_gradients)
-            batched_jacobian_fn = jax.vmap(jacobian_for_single_point)
-            # jacobians = batched_jacobian_fn(coords_subset / factor)
-            jacobians = batched_jacobian_fn(coords_subset / factor)
-
-            jacobians = jnp.eye(3, dtype=jnp.float32)[None, None, ...] + jacobians
-            jac_loss = jnp.abs(jnp.linalg.det(jacobians) - 1.)
-            jac_loss = jnp.mean(jac_loss)
-
-            if self.second_derivative:
-                second_derivative_fn_single = jax.jacfwd(jacobian_for_single_point)
-                batched_second_derivative_fn = jax.vmap(second_derivative_fn_single)
-                hessians = batched_second_derivative_fn(coords_subset)
-
-                # Beding energy regularization
-                dx_xyz = hessians[..., 0, :]
-                dy_xyz = hessians[..., 1, :]
-                dz_xyz = hessians[..., 2, :]
-
-                dx_xyz = jnp.square(dx_xyz)
-                dy_xyz = jnp.square(dy_xyz)
-                dz_xyz = jnp.square(dz_xyz)
-
-                be_loss = jnp.mean(dx_xyz[:, :, :, 0]) + jnp.mean(dy_xyz[:, :, :, 1]) + jnp.mean(dz_xyz[:, :, :, 2])
-                be_loss +=  2. * jnp.mean(dx_xyz[:, :, :, 1]) + 2. * jnp.mean(dx_xyz[:, :, :, 2]) + jnp.mean(dy_xyz[:, :, :, 2])
-            else:
-                be_loss = 0.0
-        else:
-            jac_loss = 0.0
-            be_loss = 0.0
-
-        return flow, 0.001 * jac_loss, 0.001 * be_loss, 0.0001 * jnp.sqrt((jnp.square(latent_x) + jnp.square(latent_y) + jnp.square(latent_z)).sum())
+        return flow, 0.0001 * jnp.sqrt((jnp.square(latent_x) + jnp.square(latent_y) + jnp.square(latent_z)).sum())
 
 
 class PhysDecoder(nnx.Module):
@@ -384,8 +346,8 @@ class PhysDecoder(nnx.Module):
         return images, (a, b)
 
 class Zernike3Deep(nnx.Module):
-    def __init__(self, lat_dim, total_voxels, inds, values, xsize, sr, bank_size=10000, ctf_type="apply", diff_geo=False,
-                 second_derivative=False, decoupling=False, isVae=False, L1=7, L2=7, isTomo=False, *, rngs: nnx.Rngs):
+    def __init__(self, lat_dim, total_voxels, inds, values, xsize, sr, bank_size=10000, ctf_type="apply",
+                 decoupling=False, isVae=False, L1=7, L2=7, isTomo=False, *, rngs: nnx.Rngs):
         super(Zernike3Deep, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -397,8 +359,7 @@ class Zernike3Deep(nnx.Module):
         self.isTomo = isTomo
         self.isVae = isVae
         self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, rngs=rngs, isTomo=isTomo) if decoupling or isTomo else Encoder(self.xsize, lat_dim, isVae=isVae, rngs=rngs)
-        self.flow_decoder = FlowDecoder(lat_dim, total_voxels, self.coords, 0.5 * self.xsize, diff_geo=diff_geo,
-                                        second_derivative=second_derivative, choice_key=rngs.choice(), L1=L1, L2=L2, rngs=rngs)
+        self.flow_decoder = FlowDecoder(lat_dim, total_voxels, self.coords, 0.5 * self.xsize, choice_key=rngs.choice(), L1=L1, L2=L2, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize, lat_dim=lat_dim, rngs=rngs)
 
         #### Memory bank for latent spaces ####
@@ -493,7 +454,7 @@ class Zernike3Deep(nnx.Module):
             rotations = euler_angles
 
         # Decode flow field
-        flow, _, _, _ = self.flow_decoder(latent, self.inds, self.xsize)
+        flow, _ = self.flow_decoder(latent, self.inds, self.xsize)
 
         # Consider alignments if needed
         if x.ndim == 4:
@@ -534,7 +495,7 @@ class Zernike3Deep(nnx.Module):
         return grids
 
 @jax.jit
-def train_step_zernike3deep(graphdef, state, x, labels, md, key):
+def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True):
     model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
     distributions_key, key = jax.random.split(key)
 
@@ -565,9 +526,9 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
 
         # Decode flow field
         if model.isVae:
-            flow, jac_loss, be_loss, coefficient_loss = model.flow_decoder(sample, model.inds, model.xsize)
+            flow, coefficient_loss = model.flow_decoder(sample, model.inds, model.xsize)
         else:
-            flow, jac_loss, be_loss, coefficient_loss = model.flow_decoder(latent, model.inds, model.xsize)
+            flow, coefficient_loss = model.flow_decoder(latent, model.inds, model.xsize)
 
         # Get rotation matrices
         if euler_angles.ndim == 2:
@@ -598,15 +559,21 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
             images_corrected_loss = ctfFilter(images_corrected, ctf, pad_factor=2)
             images_rigid_loss = ctfFilter(images_rigid, ctf, pad_factor=2)
         else:
-            x_loss = a * x + b
+            x_loss = x
             images_corrected_loss = images_corrected
             images_rigid_loss = images_rigid
+
+        # Adjusted image
+        x_loss_adjusted = a * jax.lax.stop_gradient(x_loss) + b
 
         # # recon_loss = dm_pix.mae(images_corrected[..., None], x_corrected[..., None]).mean()
         recon_loss = dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
         recon_loss_rigid_1 = mse(images_rigid_loss[..., None], x_loss[..., None])
         recon_loss_rigid_2 = mse(images_rigid_loss[..., None], images_corrected_loss[..., None])
         recon_loss_rigid = 0.5 * (recon_loss_rigid_1.mean() + recon_loss_rigid_2.mean())
+        recon_loss = 0.5 * (dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean() +
+                            dm_pix.mse(images_corrected_loss[..., None], x_loss_adjusted[..., None]).mean())
+        recon_loss_rigid = mse(images_rigid_loss[..., None], x_loss[..., None]).mean()
         recons_loss_all = 0.5 * (recon_loss + recon_loss_rigid)
 
         # Field norm loss
@@ -654,7 +621,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
         else:
             decoupling_loss = 0.0
 
-        loss = recons_loss_all + 0.0001 * kl_loss + (jac_loss + be_loss) + 0.001 * decoupling_loss + 1e-4 * field_norm_loss
+        loss = recons_loss_all + 0.0001 * kl_loss + 0.001 * decoupling_loss + 1e-4 * field_norm_loss
         return loss, (recon_loss, latent)
 
     # Check if Tomo mode
@@ -707,15 +674,18 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key):
 
     grads, grads_gray = grads_combined.split(params, params_grays)
 
-    optimizer.update(grads)
-    optimizer_grays.update(grads_gray)
+    if do_update:
+        optimizer.update(grads)
+        optimizer_grays.update(grads_gray)
 
-    # Update memory bank
-    model.enqueue(latent)
+        # Update memory bank
+        model.enqueue(latent)
 
-    state = nnx.state((model, optimizer, optimizer_grays))
+        state = nnx.state((model, optimizer, optimizer_grays))
 
-    return loss, recon_loss, state, key
+        return loss, recon_loss, state, key
+    else:
+        return loss, recon_loss
 
 
 @jax.jit
@@ -727,27 +697,27 @@ def validation_step_zernike3deep(graphdef, state, x, labels, md):
         if model.isTomo:
             (x, subtomogram_label) = x
 
-            # Encode latent E(z)
-            if model.isVae:
-                if model.decoupling:
-                    (sample, latent, logstd), (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
-                elif model.isTomoSIREN:
-                    (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                else:
-                    (sample, latent, logstd), (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True)
+        # Encode latent E(z)
+        if model.isVae:
+            if model.decoupling:
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+            elif model.isTomoSIREN:
+                (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
             else:
-                if model.decoupling:
-                    latent, (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
-                elif model.isTomoSIREN:
-                    latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                else:
-                    latent, (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True)
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True)
+        else:
+            if model.decoupling:
+                latent, (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+            elif model.isTomoSIREN:
+                latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+            else:
+                latent, (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True)
 
         # Decode flow field
         if model.isVae:
-            flow, jac_loss, be_loss, coefficient_loss = model.flow_decoder(sample, model.inds, model.xsize)
+            flow, coefficient_loss = model.flow_decoder(sample, model.inds, model.xsize)
         else:
-            flow, jac_loss, be_loss, coefficient_loss = model.flow_decoder(latent, model.inds, model.xsize)
+            flow, coefficient_loss = model.flow_decoder(latent, model.inds, model.xsize)
 
         # Get rotation matrices
         if euler_angles.ndim == 2:
@@ -933,7 +903,7 @@ def main():
 
     # Prepare network (Zernike3Deep)
     zernike3deep = Zernike3Deep(args.lat_dim, inds.shape[0], inds, values, vol.shape[0], args.sr,
-                                ctf_type=args.ctf_type, diff_geo=True, second_derivative=True, decoupling=True, isVae=True,
+                                ctf_type=args.ctf_type, decoupling=True, isVae=True,
                                 L1=args.L1, L2=args.L2, bank_size=len(generator.md), isTomo=isTomo,
                                 rngs=nnx.Rngs(model_key, choice=choice_key))
 
