@@ -94,7 +94,10 @@ class Encoder(nnx.Module):
             x = rearrange(x, 'b h w c -> b (h w c)')
 
             for layer in self.hidden_layers_linear:
-                x = nnx.relu(layer(x))
+                if layer.in_features != layer.out_features:
+                    x = nnx.relu(layer(x))
+                else:
+                    x = nnx.relu(x + layer(x))
 
         if return_last:
             return x
@@ -163,15 +166,20 @@ class MultiEncoder(nnx.Module):
         else:
             self.latent = Linear(256, lat_dim, rngs=rngs)
 
+        # Hidden layers latent space
+        self.hidden_layers_latent = [Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16)]
+        for _ in range(2):  # TODO: Test if 6 trains fine or go back to 2 (100 epochs)
+            self.hidden_layers_latent.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+
         # Hidden layer refinement
-        self.hidden_layers_refinement = [Linear(256, 1024, rngs=rngs, dtype=jnp.bfloat16)]
-        for _ in range(6):
-            self.hidden_layers_refinement.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_refinement = [Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16)]
+        for _ in range(2):  # TODO: Test if 6 trains fine or go back to 2 (100 epochs)
+            self.hidden_layers_refinement.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
 
         # Rigid registration of volumes
-        self.rigid_6d_rotation = nnx.Linear(1024, 6, rngs=rngs)
-        self.rotations_logsig = nnx.Linear(1024, 3, rngs=rngs)
-        self.rigid_shifts = nnx.Linear(1024, 3, rngs=rngs)
+        self.rigid_6d_rotation = nnx.Linear(256, 6, rngs=rngs)
+        self.rotations_logsig = nnx.Linear(256, 3, rngs=rngs)
+        self.rigid_shifts = nnx.Linear(256, 3, rngs=rngs)
 
         # Refinement control (residual learning)
         self.alpha_rigid_rotations = nnx.Param(1e-4)
@@ -184,9 +192,9 @@ class MultiEncoder(nnx.Module):
         x = self.encoders[encoder_id](x, return_last=True)
 
         if return_alignment_refinement:
-            x_ref = nnx.relu(self.hidden_layers_refinement[0](x))
+            x_ref = nnx.relu(x + self.hidden_layers_refinement[0](x))
             for layer in self.hidden_layers_refinement[1:]:
-                x_ref = nnx.relu(layer(x_ref))
+                x_ref = nnx.relu(layer(x_ref + x_ref))
 
             # Estimate rotations for volume registration
             rotations_6d = self.rigid_6d_rotation(x_ref)
@@ -198,6 +206,9 @@ class MultiEncoder(nnx.Module):
             # Estimate shifts for volume registration
             shifts_rigid = self.alpha_rigid_shifts * self.rigid_shifts(x_ref)
             # shifts_rigid = self.rigid_shifts(x_ref)
+
+        for layer in self.hidden_layers_latent:
+            x = nnx.relu(x + layer(x))
 
         if self.isVae:
             mean = self.mean_x(x)
@@ -246,27 +257,41 @@ class DeltaVolumeDecoder(nnx.Module):
         #     self.hidden_linear.append(HyperLinear(in_features=8, out_features=8, in_hyper_features=8, hidden_hyper_features=8, rngs=rngs, dtype=jnp.bfloat16))
         # self.hidden_linear.append(HyperLinear(in_features=8, out_features=8, in_hyper_features=8, hidden_hyper_features=8, rngs=rngs, dtype=jnp.bfloat16))
 
-        self.hidden_linear = [Linear(in_features=lat_dim, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
-        for _ in range(4):
-            self.hidden_linear.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
-
         if transport_mass:
-            self.hidden_coords_values = Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform())
+            self.hidden_coords = [Linear(in_features=lat_dim // 2, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
+            for _ in range(4):
+                self.hidden_coords.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
+            self.hidden_coords.append(Linear(in_features=8, out_features=3 * total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
+
+            self.hidden_values = [Linear(in_features=lat_dim // 2, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
+            for _ in range(4):
+                self.hidden_values.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
+            self.hidden_values.append(Linear(in_features=8, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
         else:
-            self.hidden_values = Linear(in_features=8, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform())
+            self.hidden_values = [Linear(in_features=lat_dim, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
+            for _ in range(4):
+                self.hidden_values.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
+            self.hidden_values.append(Linear(in_features=8, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
 
     def __call__(self, x):
-        # Decode voxel values
-        x = jnp.sin(30.0 * self.hidden_linear[0](x))
-        for layer in self.hidden_linear[1:]:
-            x = x + jnp.sin(1.0 * layer(x))
-
         if self.transport_mass:
-            x = self.hidden_coords_values(x)
+            x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=1)
+
+            # Decode values
+            x_map = jnp.sin(30.0 * self.hidden_values[0](x_map))
+            for layer in self.hidden_values[1:-1]:
+                x_map = jnp.sin(x + 1.0 * layer(x_map))
+            x_map = self.hidden_values[-1](x_map)
+
+            # Decode coords
+            x_coords = jnp.sin(30.0 * self.hidden_coords[0](x_coords))
+            for layer in self.hidden_coords[1:-1]:
+                x_coords = jnp.sin(x + 1.0 * layer(x_coords))
+            x_coords = self.hidden_coords[-1](x_coords)
 
             # Extract delta_coords and values
-            x = jnp.reshape(x, (x.shape[0], self.total_voxels, 4))
-            delta_coords, delta_values = x[..., :3], x[..., 3]
+            x_coords = jnp.reshape(x_coords, (x.shape[0], self.total_voxels, 3))
+            delta_coords, delta_values = x_coords, x_map
 
             # Recover volume values
             values = nnx.relu(self.reference_values + delta_values)
@@ -274,7 +299,13 @@ class DeltaVolumeDecoder(nnx.Module):
             # Recover coords (non-normalized)
             coords = self.factor * (self.coords + delta_coords)
         else:
-            x_map = self.hidden_values(x)
+            # Decode voxel values
+            x = jnp.sin(30.0 * self.hidden_values[0](x))
+            for layer in self.hidden_values[1:-1]:
+                # x = x + jnp.sin(1.0 * layer(x))
+                x = jnp.sin(x + 1.0 * layer(x))  # TODO: Test this (with 6 and 2 layers in encoder)
+
+            x_map = self.hidden_values[-1](x)
 
             # Recover volume values
             values = self.reference_values + x_map
@@ -404,11 +435,12 @@ class HetSIREN(nnx.Module):
         self.reference_volume = reference_volume
         self.reconstruction_mask = reconstruction_mask.astype(float)
         self.inds = jnp.asarray(jnp.where(reconstruction_mask > 0.0)).T
+        self.lat_dim = lat_dim
         reference_values = reference_volume[self.inds[..., 0], self.inds[..., 1], self.inds[..., 2]][None, ...]
         self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, architecture=architecture, isTomoSIREN=isTomoSIREN, rngs=rngs) \
             if decoupling or isTomoSIREN else Encoder(self.xsize, lat_dim, isVae=isVae, architecture=architecture, rngs=rngs)
         self.delta_volume_decoder = DeltaVolumeDecoder(self.inds.shape[0], lat_dim, self.xsize, self.inds, reference_values, transport_mass=transport_mass, rngs=rngs)
-        self.delta_volume_decoder_rigid = DeltaVolumeDecoder(self.inds.shape[0], lat_dim, self.xsize, self.inds, reference_values, transport_mass=False, rngs=rngs)
+        self.delta_volume_decoder_rigid = DeltaVolumeDecoder(self.inds.shape[0], lat_dim, self.xsize, self.inds, reference_values, transport_mass=True, rngs=rngs)
 
         self.phys_decoder = PhysDecoder(self.xsize, transport_mass=transport_mass)
 
@@ -534,14 +566,14 @@ class HetSIREN(nnx.Module):
         if x.ndim == 4:
             x, _ = self(x)
 
-        coords, _ = self.delta_volume_decoder(x)
+        coords, values = self.delta_volume_decoder(x)
 
         return (coords - self.delta_volume_decoder.factor * self.delta_volume_decoder.coords,
-                self.delta_volume_decoder.factor * self.delta_volume_decoder.coords)
+                values - self.delta_volume_decoder.reference_values)
 
 
-@jax.jit
-def train_step_hetsiren(graphdef, state, x, labels, md, key):
+@partial(jax.jit, static_argnames=("do_update", ))
+def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True):
     model, optimizer = nnx.merge(graphdef, state)
     distributions_key, rot_sample_key, key = jnr.split(key, 3)
 
@@ -557,6 +589,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
         phys_decoder = model.phys_decoder
         wiener2DFilter_vmap = wiener2DFilter
         ctfFilter_vmap = ctfFilter
+
+    sparse_finite_3D_differences_field = jax.vmap(sparse_finite_3D_differences, in_axes=(-1, None, None), out_axes=-1)
 
     def loss_fn(model, x):
         # Check if Tomo mode
@@ -586,6 +620,9 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
             coords, values = model.delta_volume_decoder(sample)
         else:
             coords, values = model.delta_volume_decoder(latent)
+
+        # Compute field
+        field = coords / model.delta_volume_decoder.factor - model.delta_volume_decoder.coords
 
         # Get rotation matrices
         if euler_angles.ndim == 2:
@@ -667,9 +704,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
 
         # recon_loss = dm_pix.mae(images_corrected_loss[..., None], x_loss[..., None]).mean()
         recon_loss = 0.5 * (mse(images_corrected_loss[..., None], x_loss[..., None]) + mse(images_corrected_field_loss[..., None], x_loss[..., None]))
-        recon_loss_rigid_1 = mse(images_rigid_loss[..., None], x_loss[..., None])
-        recon_loss_rigid_2 = mse(images_rigid_loss[..., None], images_corrected_loss[..., None])
-        recon_loss_rigid = 0.5 * (recon_loss_rigid_1 + recon_loss_rigid_2)
+        recon_loss_rigid = mse(images_rigid_loss[..., None], x_loss[..., None])
         recons_loss_all = 0.5 * (recon_loss + recon_loss_rigid)
 
         # L1 based denoising
@@ -681,9 +716,16 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
         # diff_z = volumes[:, :, :, 1:] - volumes[:, :, :, :-1]
         # l1_grad_loss = jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
         # l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
+
+        # Values
         diff_x, diff_y, diff_z = sparse_finite_3D_differences(values, model.inds, model.xsize)
         l1_grad_loss = jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
         l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
+
+        # Field
+        diff_field_x, diff_field_y, diff_field_z = sparse_finite_3D_differences_field(field, model.inds, model.xsize)
+        l1_grad_field_loss = jnp.abs(diff_field_x).mean() + jnp.abs(diff_field_z).mean() + jnp.abs(diff_field_y).mean()
+        l2_grad_field_loss = jnp.square(diff_field_x).mean() + jnp.square(diff_field_z).mean() + jnp.square(diff_field_y).mean()
 
         # Chimeric volume losses
         if model.local_reconstruction:
@@ -749,7 +791,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
             decoupling_loss = 0.0
 
         loss = (nll + 0.0001 * kl_loss + 0.001 * kl_pose + 0.001 * decoupling_loss
-                + 0.001 * l1_loss  + 0.001 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss)
+                + 0.001 * l1_loss  + 0.0 * (l1_grad_loss + l2_grad_loss)
+                + 0.0 * (l1_grad_field_loss + l2_grad_field_loss) + 100. * hist_loss)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
@@ -797,14 +840,17 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
     else:
         (loss, (recon_loss, latent)), grads = grad_fn(model, x)
 
-    optimizer.update(grads)
+    if do_update:
+        optimizer.update(grads)
 
-    # Update memory bank
-    model.enqueue(latent)
+        # Update memory bank
+        model.enqueue(latent)
 
-    state = nnx.state((model, optimizer))
+        state = nnx.state((model, optimizer))
 
-    return loss, recon_loss, state, key
+        return loss, recon_loss, state, key
+    else:
+        return loss, recon_loss
 
 
 @jax.jit
