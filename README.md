@@ -30,6 +30,10 @@ This package includes several tools to study conformational heterogeneity from C
 
 - **Annotate space**: Interactive inspection of conformational landscapes and conformational states
 
+# Reconstruction of motion corrected volumes
+
+- **MoDART**: Real space reconstruction with motion correction derived from deformation fields
+
 # Installation
 
 Hax needs `pip` to install its dependencies. The installation on a independent Conda environment is strongly recommended.
