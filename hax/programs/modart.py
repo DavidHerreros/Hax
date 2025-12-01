@@ -3,6 +3,7 @@
 
 import jax
 from jax import numpy as jnp
+from jax.scipy.ndimage import map_coordinates
 from flax import nnx
 import dm_pix
 
@@ -173,10 +174,10 @@ class PhysDecoder:
 
         return images
 
-class ZART(nnx.Module):
+class MoDART(nnx.Module):
     def __init__(self, reference_volume, reconstruction_mask, xsize, sr, ctf_type="apply",
                  symmetry_group="c1", reconstruct_halves=False, *, rngs: nnx.Rngs):
-        super(ZART, self).__init__()
+        super(MoDART, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
         self.sr = sr
@@ -195,7 +196,7 @@ class ZART(nnx.Module):
 
 
 @jax.jit
-def single_step_zart(graphdef, state, x, labels, md, fields_zart, values_zart, key):
+def single_step_modart(graphdef, state, x, labels, md, fields_modart, values_modart, key):
     model, optimizer = nnx.merge(graphdef, state)
 
     # Random keys
@@ -215,7 +216,7 @@ def single_step_zart(graphdef, state, x, labels, md, fields_zart, values_zart, k
         rotations_sym = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, ...], rotations)
 
         # Generate projections
-        images_corrected = phys_decoder(x, values[None, ...], fields_zart + coords[None, ...], model.xsize, rotations_sym, shifts, ctf, model.ctf_type)
+        images_corrected = phys_decoder(x, values[None, ...], fields_modart + coords[None, ...], model.xsize, rotations_sym, shifts, ctf, model.ctf_type)
 
         # Losses
         images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
@@ -282,6 +283,47 @@ def single_step_zart(graphdef, state, x, labels, md, fields_zart, values_zart, k
     return loss, recon_loss, state
 
 
+@jax.jit
+def interpolate_image_field(graphdef, state, images, initial_inds_modart):
+    xsize = images.shape[1]
+    model = nnx.merge(graphdef, state)
+    map_coordinates_vmap = jax.vmap(map_coordinates, in_axes=(-1, None, None), out_axes=-1)
+    factor = xsize.xsize / model.xsize
+
+    # Get coordinates and field
+    fields, values = model.decode_field(images)
+    # fields_values = jnp.concatenate((fields, values[..., None]), axis=-1)
+    initial_inds = model.inds
+    initial_inds_modart = initial_inds_modart / factor
+
+    # Empty grids
+    grids = jnp.zeros((images.shape[0], images.shape[1], images.shape[1], images.shape[1], 3))
+
+    # Place values on grid
+    def place_on_single_grid(grid, inds, values):
+        grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 0].set(values[..., 0])
+        grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 1].set(values[..., 1])
+        grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 2].set(values[..., 2])
+        # grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 0].set(values[..., 3])
+        return grid
+    place_on_grids = jax.vmap(place_on_single_grid, in_axes=(0, None, 0))
+    grids = place_on_grids(grids, initial_inds, fields)
+
+    # Low pass filter grids
+    fields_values_modart = []
+    for grid in grids:
+        grid_filtered = fast_gaussian_filter_3d(grid, sigma=1.0)
+        fields_values_modart.append(map_coordinates_vmap(grid_filtered, initial_inds_modart.T, 1))
+    fields_values_modart = jnp.stack(fields_values_modart, axis=0)
+
+    # Interpolate grids
+    # fields_modart = map_coordinates_vmap(grids_filtered, initial_inds_modart.T, 1)
+    fields_modart = factor * fields_values_modart
+    # fields_modart = jnp.stack([fields_modart[..., 2], fields_modart[..., 1], fields_modart[..., 0]], axis=-1)
+    # values_modart = fields_values_modart[..., 3]
+    return fields_modart, jnp.zeros_like(values)
+
+
 def main():
     import os
     import sys
@@ -303,9 +345,9 @@ def main():
     parser.add_argument("--md", required=True, type=str,
                         help="Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed")
     parser.add_argument("--vol", required=False, type=str,
-                        help="If provided, ZART will perform a refinement of this volume")
+                        help="If provided, MoDART will perform a refinement of this volume")
     parser.add_argument("--mask", required=False, type=str,
-                        help=f"Determines the initial position of the mass available to ZART to reconstruct a volume. This mask can be tight to the input volume (if provided). "
+                        help=f"Determines the initial position of the mass available to MoDART to reconstruct a volume. This mask can be tight to the input volume (if provided). "
                              f"{bcolors.WARNING}WARNING{bcolors.ENDC}: The mask provided here MUST be BINARY.")
     parser.add_argument("--load_images_to_ram", action='store_true',
                         help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
@@ -324,9 +366,9 @@ def main():
                              f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
                              f"to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions")
     parser.add_argument("--reconstruct_halves", action="store_true",
-                        help="If not provided, ZART will reconstruct a single volume. Otherwise, ZART will reconstruct two half maps by splitting the dataset into even/odd parts.")
+                        help="If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts.")
     parser.add_argument("--motion_correction", type=str,
-                        help=f"If provided, ZART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed. "
+                        help=f"If provided, MoDART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed. "
                              f"{bcolors.WARNING} NOTE {bcolors.ENDC}: When providing this parameter, you MUST give the path to a trained {bcolors.UNDERLINE} HetSIREN (with transport of mass) "
                              f"{bcolors.ENDC} or {bcolors.UNDERLINE} Zernike3Deep {bcolors.ENDC} neural network.")
     parser.add_argument("--output_path", required=True, type=str,
@@ -365,9 +407,9 @@ def main():
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     rng, model_key = jax.random.split(rng, 2)
 
-    # ZART model
-    zart = ZART(vol, mask, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
-                reconstruct_halves=args.reconstruct_halves, rngs=nnx.Rngs(model_key))
+    # MoDART model
+    modart = MoDART(vol, mask, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
+                  reconstruct_halves=args.reconstruct_halves, rngs=nnx.Rngs(model_key))
 
     # Volume adjustment (only if reference volume is provided)
     if args.vol is not None:
@@ -387,11 +429,11 @@ def main():
         graphdef_motion_correction, state_motion_correction = nnx.split(model)
 
     # Prepare summary writer
-    writer = JaxSummaryWriter(os.path.join(args.output_path, "ZART_metrics"))
+    writer = JaxSummaryWriter(os.path.join(args.output_path, "MoDART_metrics"))
 
     # Jitted functions for volume prediction
     @jax.jit
-    def get_zart_volume(graphdef, state):
+    def get_modart_volume(graphdef, state):
         model, _ = nnx.merge(graphdef, state)
         return model(filter=True)
 
@@ -449,11 +491,11 @@ def main():
         volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
         values = volumeAdjustment()
 
-        # Place values on grid and replace ZART reference volume
+        # Place values on grid and replace MoDART reference volume
         grid = jnp.zeros_like(vol)
         grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
-        zart.reference_volume = grid
-        zart.delta_volume_decoder.reference_values = values
+        modart.reference_volume = grid
+        modart.delta_volume_decoder.reference_values = values
 
     # Learning rate scheduler
     total_steps_per_epoch =  len(data_loader) if not args.reconstruct_halves else len(data_loader_even)
@@ -463,12 +505,12 @@ def main():
     # Early stopping
     early_stop = EarlyStopping(min_delta=1e-6, patience=2. * total_steps_per_epoch)
 
-    # Optimizers (ZART)
-    optimizer = nnx.Optimizer(zart, optax.adam(lr_schedule))
-    graphdef, state = nnx.split((zart, optimizer))
+    # Optimizers (MoDART)
+    optimizer = nnx.Optimizer(modart, optax.adam(lr_schedule))
+    graphdef, state = nnx.split((modart, optimizer))
 
-    # Reconstruction loop (ZART)
-    print(f"{bcolors.OKCYAN}\n###### Starting ZART reconstruction... ######")
+    # Reconstruction loop (MoDART)
+    print(f"{bcolors.OKCYAN}\n###### Starting MoDART reconstruction... ######")
     i = 0
     while not early_stop.should_stop:
         total_loss = 0
@@ -486,12 +528,13 @@ def main():
 
                 if args.motion_correction is not None:
                     x_interpolation = jnp.reshape(x, (-1, x.shape[2], x.shape[3], 1))
-                    field_zart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x_interpolation, zart.inds)
-                    field_zart = np.reshape(x, (x.shape[0], x.shape[1], field_zart.shape[1], field_zart.shape[2]))
+                    field_modart, values_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x_interpolation, modart.inds)
+                    field_modart = np.reshape(x, (x.shape[0], x.shape[1], field_modart.shape[1], field_modart.shape[2]))
                 else:
-                    field_zart = np.zeros((x.shape[0], zart.inds.shape[0], 4))[:, None, ...]
+                    field_modart = np.zeros((x.shape[0], modart.inds.shape[0], 4))[:, None, ...]
+                    values_modart = np.zeros((x.shape[0], modart.inds.shape[0]))[:, None, ...]
 
-                loss, recon_loss, state = single_step_zart(graphdef, state, x, labels, md_columns, field_zart, rng)
+                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, values_modart, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
@@ -500,11 +543,11 @@ def main():
 
                 # Summary writer (training loss)
                 if step % int(np.ceil(0.1 * len(data_loader_even))) == 0:
-                    writer.add_scalar('Training loss (ZART)',
+                    writer.add_scalar('Training loss (MoDART)',
                                       total_loss / step,
                                       i * len(data_loader_even) + step)
 
-                    writer.add_scalars('Reconstruction loss (ZART)',
+                    writer.add_scalars('Reconstruction loss (MoDART)',
                                        {"First half": total_recon_loss[0] / step, "Second half": total_recon_loss[1] / step},
                                        i * len(data_loader_even) + step)
 
@@ -521,15 +564,17 @@ def main():
 
             for (x, labels) in pbar:
                 if args.motion_correction is not None:
-                    field_zart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x, zart.inds)
+                    field_modart, values_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x, modart.inds)
                 else:
-                    field_zart = np.zeros((x.shape[0], zart.inds.shape[0], 4))
+                    field_modart = np.zeros((x.shape[0], modart.inds.shape[0], 4))
+                    values_modart = np.zeros((x.shape[0], modart.inds.shape[0]))
 
                 x = x[:, None, ...]
                 labels = labels[:, None, ...]
-                field_zart = field_zart[:, None, ...]
+                field_modart = field_modart[:, None, ...]
+                values_modart = values_modart[:, None, ...]
 
-                loss, recon_loss, state = single_step_zart(graphdef, state, x, labels, md_columns, field_zart, rng)
+                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, values_modart, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss[0]
 
@@ -538,11 +583,11 @@ def main():
 
                 # Summary writer (training loss)
                 if step % int(np.ceil(0.1 * len(data_loader))) == 0:
-                    writer.add_scalar('Training loss (ZART)',
+                    writer.add_scalar('Training loss (MoDART)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
 
-                    writer.add_scalar('Reconstruction loss (ZART)',
+                    writer.add_scalar('Reconstruction loss (MoDART)',
                                       total_recon_loss / step,
                                       i * len(data_loader) + step)
 
@@ -555,40 +600,40 @@ def main():
                 step += 1
 
         # Intermediate volume
-        zart_volume = get_zart_volume(graphdef, state)
+        modart_volume = get_modart_volume(graphdef, state)
         if args.reconstruct_halves:
-            middle_slize = int(np.round(0.5 * zart_volume[0].shape[-1]))
-            ImageHandler().write(np.array(zart_volume[0]), os.path.join(args.output_path, "zart_first_half_intermediate.mrc"), overwrite=True)
-            ImageHandler().write(np.array(zart_volume[1]), os.path.join(args.output_path, "zart_second_half_intermediate.mrc"), overwrite=True)
-            slice_xy, slice_xz, slice_yz = (min_max_scale(zart_volume[0][middle_slize, :, :]),
-                                            min_max_scale(zart_volume[0][:, middle_slize, :]),
-                                            min_max_scale(zart_volume[0][:, :, middle_slize]))
+            middle_slize = int(np.round(0.5 * modart_volume[0].shape[-1]))
+            ImageHandler().write(np.array(modart_volume[0]), os.path.join(args.output_path, "modart_first_half_intermediate.mrc"), overwrite=True)
+            ImageHandler().write(np.array(modart_volume[1]), os.path.join(args.output_path, "modart_second_half_intermediate.mrc"), overwrite=True)
+            slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[0][middle_slize, :, :]),
+                                            min_max_scale(modart_volume[0][:, middle_slize, :]),
+                                            min_max_scale(modart_volume[0][:, :, middle_slize]))
             slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-            writer.add_images("Predicted ZART first half (slices)", slices, dataformats="NHWC", global_step=i)
-            slice_xy, slice_xz, slice_yz = (min_max_scale(zart_volume[1][middle_slize, :, :]),
-                                            min_max_scale(zart_volume[1][:, middle_slize, :]),
-                                            min_max_scale(zart_volume[1][:, :, middle_slize]))
+            writer.add_images("Predicted MoDART first half (slices)", slices, dataformats="NHWC", global_step=i)
+            slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[1][middle_slize, :, :]),
+                                            min_max_scale(modart_volume[1][:, middle_slize, :]),
+                                            min_max_scale(modart_volume[1][:, :, middle_slize]))
             slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-            writer.add_images("Predicted ZART second half (slices)", slices, dataformats="NHWC", global_step=i)
+            writer.add_images("Predicted MoDART second half (slices)", slices, dataformats="NHWC", global_step=i)
         else:
-            middle_slize = int(np.round(0.5 * zart_volume.shape[-1]))
-            ImageHandler().write(np.array(zart_volume), os.path.join(args.output_path, "zart_map_intermediate.mrc"), overwrite=True)
-            slice_xy, slice_xz, slice_yz = (min_max_scale(zart_volume[middle_slize, :, :]),
-                                            min_max_scale(zart_volume[:, middle_slize, :]),
-                                            min_max_scale(zart_volume[:, :, middle_slize]))
+            middle_slize = int(np.round(0.5 * modart_volume.shape[-1]))
+            ImageHandler().write(np.array(modart_volume), os.path.join(args.output_path, "modart_map_intermediate.mrc"), overwrite=True)
+            slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[middle_slize, :, :]),
+                                            min_max_scale(modart_volume[:, middle_slize, :]),
+                                            min_max_scale(modart_volume[:, :, middle_slize]))
             slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-            writer.add_images("Predicted ZART volume (slices)", slices, dataformats="NHWC", global_step=i)
+            writer.add_images("Predicted MoDART volume (slices)", slices, dataformats="NHWC", global_step=i)
 
         i += 1
 
-    # Save final ZART volume
-    zart_volume = get_zart_volume(graphdef, state)
+    # Save final MoDART volume
+    modart_volume = get_modart_volume(graphdef, state)
     if args.reconstruct_halves:
-        ImageHandler().write(np.array(zart_volume[0]), os.path.join(args.output_path, "zart_first_half.mrc"), overwrite=True)
-        ImageHandler().write(np.array(zart_volume[1]), os.path.join(args.output_path, "zart_second_half.mrc"), overwrite=True)
-        ImageHandler().write(np.array(0.5 * (zart_volume[0] + zart_volume[1])), os.path.join(args.output_path, "zart_map.mrc"), overwrite=True)
+        ImageHandler().write(np.array(modart_volume[0]), os.path.join(args.output_path, "modart_first_half.mrc"), overwrite=True)
+        ImageHandler().write(np.array(modart_volume[1]), os.path.join(args.output_path, "modart_second_half.mrc"), overwrite=True)
+        ImageHandler().write(np.array(0.5 * (modart_volume[0] + modart_volume[1])), os.path.join(args.output_path, "modart_map.mrc"), overwrite=True)
     else:
-        ImageHandler().write(np.array(zart_volume), os.path.join(args.output_path, "zart_map.mrc"), overwrite=True)
+        ImageHandler().write(np.array(modart_volume), os.path.join(args.output_path, "modart_map.mrc"), overwrite=True)
 
 
 if __name__ == "__main__":
