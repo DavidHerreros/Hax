@@ -566,11 +566,6 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
         # Adjusted image
         x_loss_adjusted = a * jax.lax.stop_gradient(x_loss) + b
 
-        # # recon_loss = dm_pix.mae(images_corrected[..., None], x_corrected[..., None]).mean()
-        recon_loss = dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
-        recon_loss_rigid_1 = mse(images_rigid_loss[..., None], x_loss[..., None])
-        recon_loss_rigid_2 = mse(images_rigid_loss[..., None], images_corrected_loss[..., None])
-        recon_loss_rigid = 0.5 * (recon_loss_rigid_1.mean() + recon_loss_rigid_2.mean())
         recon_loss = 0.5 * (dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean() +
                             dm_pix.mse(images_corrected_loss[..., None], x_loss_adjusted[..., None]).mean())
         recon_loss_rigid = mse(images_rigid_loss[..., None], x_loss[..., None]).mean()
@@ -1012,13 +1007,13 @@ def main():
         @partial(jax.jit, static_argnames=["ctf_type", "return_latent", "corrupt_projection_with_ctf"])
         def zernike3deep_decode_image(graphdef, state, x, labels, md, ctf_type=None, return_latent=False,
                                   corrupt_projection_with_ctf=False):
-            model, _ = nnx.merge(graphdef, state)
+            model, _, _ = nnx.merge(graphdef, state)
             return model.decode_image(x, labels, md, ctf_type=ctf_type, return_latent=return_latent,
                                       corrupt_projection_with_ctf=corrupt_projection_with_ctf)
 
         @jax.jit
         def zernike3deep_decode_volume(graphdef, state, x):
-            model, _ = nnx.merge(graphdef, state)
+            model, _, _ = nnx.merge(graphdef, state)
             return model.decode_volume(x)
 
         image_resize = jax.jit(jax.image.resize, static_argnames=("shape", "method"))
