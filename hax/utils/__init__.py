@@ -3,6 +3,7 @@ from .ctf import computeCTF
 from .euler import euler_matrix_batch, euler_from_matrix
 from .grid_interpolation import interpolate
 from .fourier_filters import wiener2DFilter, ctfFilter, fourier_resize, low_pass_3d, low_pass_2d, bspline_3d, rfft2_padded, irfft2_padded, fourier_slice_interpolator
+from .convolutional_filters import fast_gaussian_filter_3d
 from .zernike3d import computeBasis, basisDegreeVectors, precomputePolynomialsZernike, precomputePolynomialsSph
 from .segmentation import get_segmentation_centers, watershed_segmentation
 from .normalizers import min_max_scale, standard_normalization
