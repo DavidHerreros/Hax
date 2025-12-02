@@ -1,12 +1,12 @@
-from . import checkpointer
-from . import generators
-from . import layers
-from . import networks
-from . import programs
-from . import utils
-from . import metrics
-from . import viewers
-from . import schedulers
+from hax import checkpointer
+from hax import generators
+from hax import layers
+from hax import networks
+from hax import programs
+from hax import utils
+from hax import metrics
+from hax import viewers
+from hax import schedulers
 
 __all__ = [
     checkpointer,
