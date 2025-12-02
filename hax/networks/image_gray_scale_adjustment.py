@@ -29,11 +29,15 @@ class ImageAdjustment(nnx.Module):
         self.latent = nnx.Linear(32, lat_dim, rngs=rngs)
 
         if predict_value:
-            self.a = nnx.Linear(32, 1, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.ones)
-            self.b = nnx.Linear(32, 1, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.zeros)
+            self.a = nnx.Linear(32, 1, rngs=rngs, kernel_init=jax.nn.initializers.lecun_normal(),
+                                bias_init=jax.nn.initializers.ones)
+            self.b = nnx.Linear(32, 1, rngs=rngs, kernel_init=jax.nn.initializers.lecun_normal(),
+                                bias_init=jax.nn.initializers.zeros)
         else:
-            self.a = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.ones)
-            self.b = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.zeros)
+            self.a = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=jax.nn.initializers.lecun_normal(),
+                                bias_init=jax.nn.initializers.ones)
+            self.b = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=jax.nn.initializers.lecun_normal(),
+                                bias_init=jax.nn.initializers.zeros)
 
     def __call__(self, x):
         if x.ndim == 4:
