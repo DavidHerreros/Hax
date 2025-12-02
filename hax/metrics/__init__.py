@@ -1,1 +1,1 @@
-from .writer import JaxSummaryWriter
+from hax.metrics.writer import JaxSummaryWriter

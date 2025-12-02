@@ -1,1 +1,1 @@
-from .cli import main
+from hax.cli.cli import main

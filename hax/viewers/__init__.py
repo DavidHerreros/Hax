@@ -1,4 +1,4 @@
-from . import annotate_space
+from hax.viewers import annotate_space
 
 __all__ = [
     annotate_space,

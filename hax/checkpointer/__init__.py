@@ -1,1 +1,1 @@
-from .nn_checkpointer import NeuralNetworkCheckpointer
+from hax.checkpointer.nn_checkpointer import NeuralNetworkCheckpointer
