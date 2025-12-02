@@ -1,6 +1,10 @@
+# Keeping Hatch in the loop in case it is useful in the future
+
 [build-system]
-requires = ["hatchling", "hatch-vcs", "hatch-requirements-txt"]
-build-backend = "hatchling.build"
+#requires = ["hatchling", "hatch-vcs", "hatch-requirements-txt"]
+#build-backend = "hatchling.build"
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "hax"
@@ -11,20 +15,28 @@ requires-python = ">=3.10,<3.12"
 [project.scripts]
 project_manager = "hax.cli:main"
 
-[tool.hatch.version]
-path = "hax/__init__.py"
+[tool.setuptools.packages.find]
+where = ["."]
+namespaces = false
 
-[tool.hatch.metadata.hooks.requirements_txt]
-files = ["requirements.txt"]
+[tool.setuptools.dynamic]
+version = {attr = "hax.__version__"}
+dependencies = {file = ["requirements.txt"]}
 
-# https://mypy.readthedocs.io/en/stable/config_file.html
-[tool.mypy]
-files = "src/**/"
-strict = true
-disallow_any_generics = false
-disallow_subclassing_any = false
-show_error_codes = true
-pretty = true
+#[tool.hatch.version]
+#path = "hax/__init__.py"
+#
+#[tool.hatch.metadata.hooks.requirements_txt]
+#files = ["requirements.txt"]
+#
+## https://mypy.readthedocs.io/en/stable/config_file.html
+#[tool.mypy]
+#files = "src/**/"
+#strict = true
+#disallow_any_generics = false
+#disallow_subclassing_any = false
+#show_error_codes = true
+#pretty = true
 
 [tool.uv.pip]
 extra-index-url = ["https://download.pytorch.org/whl/cpu", "https://download.pytorch.org/whl/cpu"]
