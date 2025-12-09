@@ -253,7 +253,7 @@ class DeltaVolumeDecoder(nnx.Module):
         self.coords = (coords - self.factor) / self.factor
 
         # Graph from coordinates
-        if not jnp.all(reference_values == 0):
+        if not jnp.all(reference_values == 0) and transport_mass:
             self.edge_index, _ = build_graph_from_coordinates(self.coords[0], k=2, radius_factor=1.5)
 
         # Delta volume decoder (TODO: Check and fix hypernetwork - compare with TF implementation)
@@ -813,8 +813,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True):
             decoupling_loss = 0.0
 
         loss = (nll + 0.0001 * kl_loss + 0.001 * kl_pose + 0.001 * decoupling_loss
-                + 0.0001 * l1_loss  + 0.0 * (l1_grad_loss + l2_grad_loss)
-                + 0.0 * (l1_grad_field_loss + l2_grad_field_loss) + 100. * hist_loss)
+                + 0.01 * l1_loss + loss_graph + 100. * hist_loss)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
