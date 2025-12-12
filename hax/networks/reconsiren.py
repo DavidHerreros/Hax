@@ -98,25 +98,25 @@ class Encoder(nnx.Module):
         # Convolutional hidden layers
         for layer in self.hidden_layers_conv:
             if layer.in_features == layer.out_features and 1 in layer.strides:
-                x = nnx.relu(x + layer(x))
+                x = nnx.gelu(x + layer(x))  # or nnx.Relu (TODO: Try leaky relu)
             else:
-                x = nnx.relu(layer(x))
+                x = nnx.gelu(layer(x))  # or nnx.Relu (TODO: Try leaky relu)
 
         # Linear hidden layers
         x = rearrange(x, 'b h w c -> b (h w c)')
         for layer in self.hidden_layers_linear[:-1]:
             if layer.in_features == layer.out_features:
-                x = nnx.relu(x + layer(x))
+                x = nnx.gelu(x + layer(x))  # or nnx.Relu (TODO: Try leaky relu)
             else:
-                x = nnx.relu(layer(x))
+                x = nnx.gelu(layer(x))  # or nnx.Relu (TODO: Try leaky relu)
         x = self.hidden_layers_linear[-1](x)
 
         # First output: rotation matrices
-        rotation_9d = nnx.relu(self.hidden_9d_rotation[0](x))
+        rotation_9d = nnx.gelu(self.hidden_9d_rotation[0](x))  # or nnx.Relu (TODO: Try leaky relu)
         for layer in self.hidden_9d_rotation[1:-1]:
-            rotation_9d = nnx.relu(rotation_9d + layer(rotation_9d))
-        rotation_9d = self.hidden_9d_rotation[-1](rotation_9d)  # TODO: THIS WAS WORKING WITH JUST ONE LAYER!! CHECK IN THE FUTURE IN CASE IT IS USEFUL
-        # rotation_9d = self.hidden_9d_rotation[-1](x)  # TODO: THIS WAS WORKING WITH JUST ONE LAYER!! CHECK IN THE FUTURE IN CASE IT IS USEFUL
+            rotation_9d = nnx.gelu(rotation_9d + layer(rotation_9d))  # or nnx.Relu (TODO: Try leaky relu)
+        rotation_9d = self.hidden_9d_rotation[-1](rotation_9d)
+        # rotation_9d = self.hidden_9d_rotation[-1](x)  # Keep for reference: before only one layer needed
 
         if self.refine_current_assignment:
             rotations_6d = rotation_9d.reshape(x.shape[0] * self.num_components, 6)
@@ -141,9 +141,9 @@ class Encoder(nnx.Module):
             rotations = rotations.reshape(x.shape[0], self.num_components, 3, 3)
 
         # Third output: in plane shifts
-        in_plane_shifts = nnx.relu(self.hidden_shifts[0](x))
+        in_plane_shifts = nnx.gelu(self.hidden_shifts[0](x))  # or nnx.Relu (TODO: Try leaky relu)
         for layer in self.hidden_shifts[1:-1]:
-            in_plane_shifts = nnx.relu(in_plane_shifts + layer(in_plane_shifts))
+            in_plane_shifts = nnx.gelu(in_plane_shifts + layer(in_plane_shifts))  # or nnx.Relu (TODO: Try leaky relu)
         # in_plane_shifts = 0.5 * self.input_dim * self.hidden_shifts[-1](in_plane_shifts)
         in_plane_shifts = self.hidden_shifts[-1](in_plane_shifts)
         if self.refine_current_assignment:
@@ -153,9 +153,9 @@ class Encoder(nnx.Module):
         in_plane_shifts = jnp.broadcast_to(in_plane_shifts[:, None, :], (in_plane_shifts.shape[0], self.num_components, 2))
 
         # Latent space (heterogeneity)
-        latent = nnx.relu(self.hidden_latent[0](x))
+        latent = nnx.gelu(self.hidden_latent[0](x))  # or nnx.Relu (TODO: Try leaky relu)
         for layer in self.hidden_latent[1:-1]:
-            latent = nnx.relu(latent + layer(latent))
+            latent = nnx.gelu(latent + layer(latent))  # or nnx.Relu (TODO: Try leaky relu)
         mean = self.mean_x(latent)
         logstd = self.logstd_x(latent)
         sample = self.sample_gaussian(mean, logstd)
@@ -452,7 +452,7 @@ class ReconSIREN(nnx.Module):
         self.phys_decoder = PhysDecoder(self.xsize, transport_mass=transport_mass)
 
         # Hyperparameter tuning
-        self.alpha_uniform = nnx.Param(1e-4)
+        self.alpha_uniform = nnx.Param(0.1)
 
         #### Memory bank for latent spaces ####
         self.bank_size = bank_size
@@ -1128,14 +1128,13 @@ def main():
         writer = JaxSummaryWriter(os.path.join(args.output_path, "ReconSIREN_metrics"))
 
         # Jitted functions for volume prediction
-        @jax.jit
-        def decode_volume(graphdef, state):
-            model, _, _, _ = nnx.merge(graphdef, state)
+        @nnx.jit
+        def decode_volume(model):
             return model.delta_volume_decoder.decode_volume()
 
-        @jax.jit
-        def decode_het_volume(graphdef, state, x):
-            model, _, _, _ = nnx.merge(graphdef, state)
+        # Decode volume
+        @nnx.jit
+        def decode_het_volume(model, x):
             return model.decode_het_volume(x)
 
         # Prepare data loader
@@ -1271,7 +1270,8 @@ def main():
 
             if i % 5 == 0:
                 # Example of predicted data for Tensorboard
-                volume = decode_volume(graphdef, state)
+                reconsiren, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
+                volume = decode_volume(reconsiren)
                 middle_slize = int(np.round(0.5 * volume.shape[-1]))
                 ImageHandler().write(np.array(volume), os.path.join(args.output_path, "reconsiren_map_intermediate.mrc"),
                                      overwrite=True)
@@ -1282,15 +1282,14 @@ def main():
                 writer.add_images("Predicted volume (slices)", slices, dataformats="NHWC", global_step=i)
 
                 # Plot angular distribution
-                reconsiren_intermediate, _, _, _ = nnx.merge(graphdef, state)
-                euler_angles = np.array(reconsiren_intermediate.memory_bank.value)
+                euler_angles = np.array(reconsiren.memory_bank.value)
                 fig, _ = plot_angular_distribution(euler_angles)
                 writer.add_figure("Angular distribution density", fig, global_step=i)
 
                 # Predict some heterogeneous volumes
                 pbar_pred = tqdm(data_loader_full, desc=f"Latents prediction", file=sys.stdout, ascii=" >=", colour="green")
                 latents = []
-                graphdef_aux, state_aux = nnx.split(reconsiren_intermediate)
+                graphdef_aux, state_aux = nnx.split(reconsiren)
                 for (x, labels) in pbar_pred:
                     _, _, latent = predict_angular_assignment_step_reconsiren(graphdef_aux, state_aux, x, labels, md_columns)
                     latents.append(np.array(latent))
@@ -1299,7 +1298,7 @@ def main():
                 centers = kmeans.cluster_centers_
                 idx = 1
                 for center in centers:
-                    decoded = decode_het_volume(graphdef, state, center[None, ...])
+                    decoded = decode_het_volume(reconsiren, center[None, ...])
                     ImageHandler().write(np.array(decoded), os.path.join(args.output_path, f"reconsiren_hetmap_{idx:02d}.mrc"), overwrite=True)
                     idx += 1
 
