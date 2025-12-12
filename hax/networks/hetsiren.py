@@ -73,32 +73,32 @@ class Encoder(nnx.Module):
             x = rearrange(x, 'b h w c -> b (h w c)')
 
             for layer in self.hidden_layers:
-                x = nnx.relu(layer(x))
+                x = nnx.leaky_relu(layer(x))  # or nnx.relu
 
         elif self.architecture == "convnn":
             x = rearrange(x, 'b h w c -> b (h w c)')
 
-            x = nnx.relu(self.hidden_layers_conv[0](x))
+            x = nnx.leaky_relu(self.hidden_layers_conv[0](x))  # or nnx.relu
 
             x = rearrange(x, 'b (h w c) -> b h w c', h=self.input_conv_dim, w=self.input_conv_dim, c=1)
 
             for layer in self.hidden_layers_conv[1:]:
                 if layer.in_features != layer.out_features:
-                    x = nnx.relu(layer(x))
+                    x = nnx.leaky_relu(layer(x))  # or nnx.relu
                 else:
                     aux = layer(x)
                     if aux.shape[1] == x.shape[1]:
-                        x = nnx.relu(x + aux)
+                        x = nnx.leaky_relu(x + aux)  # or nnx.relu
                     else:
-                        x = nnx.relu(aux)
+                        x = nnx.leaky_relu(aux)  # or nnx.relu
 
             x = rearrange(x, 'b h w c -> b (h w c)')
 
             for layer in self.hidden_layers_linear:
                 if layer.in_features != layer.out_features:
-                    x = nnx.relu(layer(x))
+                    x = nnx.leaky_relu(layer(x))  # or nnx.relu
                 else:
-                    x = nnx.relu(x + layer(x))
+                    x = nnx.leaky_relu(x + layer(x))  # or nnx.relu
 
         if return_last:
             return x
@@ -193,9 +193,9 @@ class MultiEncoder(nnx.Module):
         x = self.encoders[encoder_id](x, return_last=True)
 
         if return_alignment_refinement:
-            x_ref = nnx.relu(x + self.hidden_layers_refinement[0](x))
+            x_ref = nnx.leaky_relu(x + self.hidden_layers_refinement[0](x))  # or nnx.relu
             for layer in self.hidden_layers_refinement[1:]:
-                x_ref = nnx.relu(layer(x_ref + x_ref))
+                x_ref = nnx.leaky_relu(layer(x_ref + x_ref))  # or nnx.relu
 
             # Estimate rotations for volume registration
             rotations_6d = self.rigid_6d_rotation(x_ref)
@@ -209,7 +209,7 @@ class MultiEncoder(nnx.Module):
             # shifts_rigid = self.rigid_shifts(x_ref)
 
         for layer in self.hidden_layers_latent:
-            x = nnx.relu(x + layer(x))
+            x = nnx.leaky_relu(x + layer(x))  # or nnx.relu
 
         if self.isVae:
             mean = self.mean_x(x)
