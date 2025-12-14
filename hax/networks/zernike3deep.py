@@ -503,6 +503,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
     distributions_key, key = jax.random.split(key)
 
     distance_regularizer_from_graph_batch = jax.vmap(distance_regularizer_from_graph, in_axes=(None, 0, None))
+    repulsion_from_graph_batch = jax.vmap(repulsion_from_graph, in_axes=(None, 0, None))
 
     def loss_fn(model, x):
         # Check if Tomo mode
@@ -585,6 +586,8 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
         # Graph based loss
         loss_graph = distance_regularizer_from_graph_batch(model.coords, model.coords + flow / (0.5 * model.xsize),
                                                            model.flow_decoder.edge_index).mean()
+        loss_graph += repulsion_from_graph_batch(model.coords, model.coords + flow / (0.5 * model.xsize),
+                                                 model.flow_decoder.edge_index).mean()
 
         # Decoupling
         if model.decoupling or model.isTomo:
