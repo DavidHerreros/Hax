@@ -248,6 +248,9 @@ class FlowDecoder(nnx.Module):
         self.sph_coeffs = precomputePolynomialsSph(L2)
         self.zernike_coeffs = precomputePolynomialsZernike(L2, L1)
 
+        # Graph from coordinates
+        self.edge_index, _ = build_graph_from_coordinates(self.coords, k=2, radius_factor=1.5)
+
         # Coefficients layers
         self.hidden_layers_coeff = [Linear(latent_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         for _ in range(3):
@@ -286,7 +289,7 @@ class PhysDecoder(nnx.Module):
         self.xsize = xsize
 
         # Gray level adjustment
-        self.imageAdjustment = ImageAdjustment(lat_dim=lat_dim, xsize=xsize, predict_value=False, rngs=rngs)
+        self.imageAdjustment = ImageAdjustment(lat_dim=lat_dim, xsize=xsize, predict_value=True, rngs=rngs)
 
     def __call__(self, flow, x, inds, values, xsize, rotations, shifts, ctf, ctf_type):
         # Indices to coords
@@ -353,7 +356,7 @@ class Zernike3Deep(nnx.Module):
         self.ctf_type = ctf_type
         self.sr = sr
         self.inds = jnp.array(inds)
-        self.coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1) - 0.5 * self.xsize
+        self.coords = (jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1) - 0.5 * self.xsize) / (0.5 * self.xsize)
         self.values = jnp.array(values)
         self.decoupling = decoupling if not isTomo else False
         self.isTomo = isTomo
@@ -499,6 +502,8 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
     model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
     distributions_key, key = jax.random.split(key)
 
+    distance_regularizer_from_graph_batch = jax.vmap(distance_regularizer_from_graph, in_axes=(None, 0, None))
+
     def loss_fn(model, x):
         # Check if Tomo mode
         if model.isTomo:
@@ -562,10 +567,9 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
             images_rigid_loss = images_rigid
 
         # Adjusted image
-        x_loss_adjusted = a * jax.lax.stop_gradient(x_loss) + b
+        images_corrected_loss = a * images_corrected_loss + b
 
-        recon_loss = 0.5 * (dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean() +
-                            dm_pix.mse(images_corrected_loss[..., None], x_loss_adjusted[..., None]).mean())
+        recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
         recon_loss_rigid = mse(images_rigid_loss[..., None], x_loss[..., None]).mean()
         recons_loss_all = 0.5 * (recon_loss + recon_loss_rigid)
 
@@ -577,6 +581,10 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
             kl_loss = -0.5 * jnp.sum(1 + 2 * logstd - jnp.square(jnp.exp(logstd)) - jnp.square(latent))
         else:
             kl_loss = 0.0
+
+        # Graph based loss
+        loss_graph = distance_regularizer_from_graph_batch(model.coords, model.coords + flow / (0.5 * model.xsize),
+                                                           model.flow_decoder.edge_index).mean()
 
         # Decoupling
         if model.decoupling or model.isTomo:
@@ -614,7 +622,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
         else:
             decoupling_loss = 0.0
 
-        loss = recons_loss_all + 0.0001 * kl_loss + 0.001 * decoupling_loss + 1e-4 * field_norm_loss
+        loss = recons_loss_all + 0.0001 * kl_loss + 0.001 * decoupling_loss + 1e-4 * field_norm_loss + loss_graph
         return loss, (recon_loss, latent)
 
     # Check if Tomo mode
