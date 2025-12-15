@@ -72,11 +72,17 @@ class MetaDataGenerator:
         if images_order is None:
             images_order = np.arange(len(self.md))
 
+        def getMetaDataImage(row_id):
+            imgs = self.md.getMetaDataImage(row_id)
+            if imgs.ndim < 3:
+                imgs = imgs[None, ...]
+            return imgs
+
         if not os.path.isdir(mmap_output_dir):
             print(f"{bcolors.OKCYAN}\n###### Creating MMAP from images... ######")
             np_ninja.from_generator(
                 out_dir=mmap_output_dir,
-                sample_generator=map(self.md.getMetaDataImage, images_order),
+                sample_generator=map(getMetaDataImage, images_order),
                 batch_size=4096,
                 verbose=True
             )
