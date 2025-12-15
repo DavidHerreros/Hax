@@ -500,3 +500,37 @@ def build_graph_from_coordinates(
     cutoff_jnp = jnp.asarray(cutoff, dtype=centers.dtype if isinstance(centers, jnp.ndarray) else jnp.float32)
 
     return edge_index, cutoff_jnp
+
+
+def sample_mask_points(mask, N):
+    """
+    Selects N random points from a binary mask without replacement.
+
+    Args:
+        mask (np.ndarray): The input boolean or binary mask (M, M, M).
+        N (int): The number of points to select.
+
+    Returns:
+        np.ndarray: A new mask of the same shape with only the N selected points.
+    """
+    # 1. Find the flat indices of all non-zero elements (points equal to 1)
+    flat_indices = np.flatnonzero(mask)
+
+    # Safety check: ensure we have enough points to sample
+    if len(flat_indices) < N:
+        raise ValueError(f"Mask only has {len(flat_indices)} points, cannot sample {N}.")
+
+    # 2. Randomly select N indices without replacement
+    # explicit generator is used for better reproducibility control,
+    # but np.random.choice works fine too.
+    rng = np.random.default_rng()
+    selected_indices = rng.choice(flat_indices, size=N, replace=False)
+
+    # 3. Create an empty flat volume
+    out_flat = np.zeros(mask.size, dtype=mask.dtype)
+
+    # 4. Set the selected points to 1
+    out_flat[selected_indices] = 1
+
+    # 5. Reshape back to the original (M, M, M) dimensions
+    return out_flat.reshape(mask.shape)
