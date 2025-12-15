@@ -1067,7 +1067,7 @@ def main():
     if args.mask is not None:
         mask = ImageHandler(args.mask).getData()
     else:
-        mask = ImageHandler().createCircularMask(boxSize=xsize, radius=int(0.25 * xsize), is3D=True)
+        mask = ImageHandler().createCircularMask(boxSize=xsize, radius=int(0.125 * xsize), is3D=True)
 
     # Data loading approach
     if args.load_images_to_ram:
