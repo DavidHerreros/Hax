@@ -27,3 +27,4 @@ torch<=2.0.1
 cuml-cu12==25.6.*
 umap-learn<0.6.0
 mmap_ninja<=0.8.0
+chex<=0.1.90
