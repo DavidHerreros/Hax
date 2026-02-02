@@ -4,21 +4,15 @@
 import os
 import numpy as np
 from datetime import datetime
-import matplotlib.pyplot as plt
-from skimage import measure
-from scipy.stats import median_abs_deviation
-from scipy.ndimage import gaussian_filter
 
-from xmipp_metadata.image_handler import ImageHandler
-
-from torch.utils.tensorboard import SummaryWriter
+from tensorboardX import SummaryWriter
 
 import jax
 import jax.numpy as jnp
 from jax import device_get
 from jax.numpy import ndarray as JaxArray
 
-from hax.utils import bcolors, min_max_scale, low_pass_3d
+from hax.utils import min_max_scale, low_pass_3d
 
 
 class JaxSummaryWriter(SummaryWriter):
