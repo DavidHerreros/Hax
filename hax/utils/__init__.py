@@ -16,3 +16,4 @@ from .reconstruction import reconstruct_volume_streaming
 from .optimal_transport_functions import compute_swd_matrix
 from .plots import plot_angular_distribution
 from .hyperparameter_tuning import find_max_batch_size
+from .image_transformations import apply_batch_translations
