@@ -7,7 +7,6 @@ from contextlib import closing
 
 import jax
 import jax.numpy as jnp
-from jax.scipy.ndimage import map_coordinates
 import optax
 from flax import nnx
 
@@ -121,7 +120,7 @@ def splat_weights_bilinear(grid_shape, means, weights, sigma, rotations, shifts,
     return images
 
 
-def get_outlier_mask(means, k=8, std_dev_mult=2.0):
+def get_outlier_mask(means, k=8, std_dev_mult=1.5):
     """
     Args:
         means: (N, 3) array of positions.
@@ -267,9 +266,9 @@ class GaussianSplatModel(nnx.Module):
 
     def __call__(self, **kwargs):
         # Forward pass logic
-        means = self.means.value
-        weights = jax.nn.softplus(self.weights.value)
-        sigma = jax.nn.softplus(self.sigma_param.value)
+        means = self.means.get_value()
+        weights = nnx.relu(self.weights.get_value())
+        sigma = nnx.relu(self.sigma_param.get_value())
 
         if "projection_parameters" in kwargs.keys():
             projection_parameters = kwargs.pop("projection_parameters")
@@ -311,59 +310,30 @@ class GaussianSplatModel(nnx.Module):
 
 # --- 3. ADAPTIVE LOGIC (NNX Compatible) ---
 
-def get_pruning_mask(means, weights, prune_threshold, target_vol=None, k_nn=3, std_dev_mult=2.0, outlier_thresh=2.0):
-    actual_weights = jax.nn.softplus(weights)
-    keep_mask = actual_weights > prune_threshold
-
-    # Signal-aware pruning
-    # if target_vol is not None:
-    #     factor = 0.5 * target_vol.shape[0]
-    #     voxel_coords = factor * means + factor
-    #     target_values_at_means = np.array(map_coordinates(target_vol, voxel_coords.T, order=0))
-    #     empty_space_mask = target_values_at_means > 1e-6
-    #     # oob_mask = np.logical_not(jnp.any(jnp.abs(means) > 0.99, axis=-1))
-    #
-    #     # Apply masks
-    #     keep_mask = np.logical_and(keep_mask, empty_space_mask)
-
-    # Outliers pruning:
-    if means.shape[0] > 100:
-        connected_mask = get_outlier_mask(means, k=k_nn, std_dev_mult=std_dev_mult)
-        keep_mask = np.logical_and(keep_mask, connected_mask)
-
-    # MAD pruning
-    medians = np.median(means, axis=0)
-    mad = np.median(np.abs(means - medians), axis=0) / 0.6745
-    mad = np.where(mad == 0, 1e-6, mad)
-    z_scores = np.abs(means - medians) / mad
-    mad_mask = np.all(z_scores < outlier_thresh, axis=1)
-    keep_mask = np.logical_and(keep_mask, mad_mask)
-
-    return keep_mask
-
-
-def adapt_gaussians(model, grads, target_vol, grad_threshold, prune_threshold, k_nn=3, lr=None, optimizer=None,
-                    std_dev_mult=2.0):
+def adapt_gaussians(model, grads, grad_threshold, prune_threshold, lr=None, optimizer=None):
     """
     Modifies the model structure (adds/removes params) and re-initializes optimizer.
     """
-    means = model.means.value
-    weights = model.weights.value
+    means = model.means.get_value()
+    weights = model.weights.get_value()
+    sigma = nnx.relu(model.sigma_param.get_value())
 
     # 1. SPLIT LOGIC
-    grad_means = grads.means.value  # Access gradient of means from NNX grads object
+    grad_means = grads.means.get_value()  # Access gradient of means from NNX grads object
     grad_norms = jnp.linalg.norm(grad_means, axis=-1)
 
     split_mask = grad_norms > grad_threshold
     n_split = jnp.sum(split_mask)
 
     # 2. PRUNE LOGIC
-    keep_mask = get_pruning_mask(means, weights, prune_threshold, target_vol=target_vol, k_nn=k_nn, std_dev_mult=std_dev_mult)
+    actual_weights = nnx.relu(weights)
+    keep_mask = actual_weights > prune_threshold
 
     # Filter arrays
     means = means[keep_mask]
     weights = weights[keep_mask]
     split_mask = split_mask[keep_mask]
+    do_not_split_mask = np.logical_not(split_mask)
 
     if n_split > 0:
         # print(f"   -> Splitting {n_split} gaussians...")
@@ -371,16 +341,17 @@ def adapt_gaussians(model, grads, target_vol, grad_threshold, prune_threshold, k
         parent_weights = weights[split_mask]
 
         # Perturb means
-
-        new_means = parent_means + np.random.normal(0, 0.02 / (0.5 * target_vol.shape[0]), parent_means.shape)  # Or 0.5 instead of 0.02
+        noise = np.random.normal(0, 0.0001, parent_means.shape)
+        new_means = parent_means + noise
+        old_means = parent_means - noise
         # Halve weights
-        new_weights = 0.001 * parent_weights
+        new_weights = old_weights = 0.5 * parent_weights * np.exp((np.linalg.norm(noise, axis=-1) ** 2.) / (2. * sigma ** 2.))
 
         # Append
-        means = jnp.concatenate([means, new_means])
-        weights = jnp.concatenate([weights, new_weights])
+        means = jnp.concatenate([means[do_not_split_mask], old_means, new_means])
+        weights = jnp.concatenate([weights[do_not_split_mask], old_weights, new_weights])
 
-    # print(f"   -> Count: {model.means.value.shape[0]} -> {means.shape[0]}")
+    # print(f"   -> Count: {model.means.get_value().shape[0]} -> {means.shape[0]}")
 
     # 3. UPDATE MODEL PARAMETERS
     # In NNX, we can directly assign new arrays to the params
@@ -392,9 +363,9 @@ def adapt_gaussians(model, grads, target_vol, grad_threshold, prune_threshold, k
     # is invalid. We must re-create the optimizer wrapper for the new model structure.
     # Note: This loses momentum history, which is standard in Gaussian Splatting adaptive steps.
     if optimizer is not None:
-        new_optimizer = nnx.Optimizer(model, optimizer.tx)
+        new_optimizer = nnx.Optimizer(model, optimizer.tx, wrt=nnx.Param)
     elif lr is not None:
-        new_optimizer = nnx.Optimizer(model, optax.adamw(lr))
+        new_optimizer = nnx.Optimizer(model, optax.adamw(lr), wrt=nnx.Param)
     else:
         raise ValueError("Either optimizer of lr must be specified")
 
@@ -411,23 +382,26 @@ def training_step_volume(graphdef, state, target, update=True):
 
         recon_loss = jnp.mean((recon - target) ** 2.)
 
-        l1_loss = 0.00001 * jax.nn.softplus(model.weights.value).mean()
+        l1_loss = 0.001 * jnp.mean(jnp.abs(recon))
 
-        # l1_loss = jnp.mean(jnp.abs(recon))
-        #
         # diff_x = recon[1:, :, :] - recon[:-1, :, :]
         # diff_y = recon[:, 1:, :] - recon[:, :-1, :]
         # diff_z = recon[:, :, 1:] - recon[:, :, :-1]
-        # l1_grad_loss = jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
+        # l1_grad_loss = 0.00001 * jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
         # l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
 
-        return recon_loss + l1_loss
+        # Boundary violation loss
+        means = model.means.get_value()
+        violation = jax.nn.relu(jnp.abs(means) - 0.9)
+        boundary_loss = jnp.sum(violation ** 2.)
+
+        return recon_loss + l1_loss + boundary_loss
 
     loss_val, grads = nnx.value_and_grad(loss_fn)(model, target)
 
     # Apply updates directly to the model state managed by optimizer
     if update:
-        optimizer.update(grads)
+        optimizer.update(model, grads)
         state = nnx.state((model, optimizer))
 
     return loss_val, grads, state
@@ -443,7 +417,7 @@ def training_step_images(graphdef, state, target, projection_parameters, sigma_r
 
         recon_loss = jnp.mean((recon_images - target) ** 2.)
 
-        l1_loss = 0.001 * jax.nn.softplus(model.weights.value).mean()
+        l1_loss = 0.001 * jnp.abs(model.weights.get_value()).mean()
 
         # l1_loss = jnp.mean(jnp.abs(recon_vol))
         #
@@ -453,16 +427,21 @@ def training_step_images(graphdef, state, target, projection_parameters, sigma_r
         # l1_grad_loss = jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
         # l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
 
-        sigma_loss = jnp.square(1.0 - jax.nn.softplus(model.sigma_param.value).mean())
+        sigma_loss = jnp.square(1.0 - nnx.relu(model.sigma_param.get_value()).mean())
+
+        # Boundary violation loss
+        means = model.means.get_value()
+        violation = jax.nn.relu(jnp.abs(means) - 0.9)
+        boundary_loss = jnp.sum(violation ** 2.)
 
         # return recon_loss + l1_loss + 0.01 * (l1_grad_loss + l2_grad_loss) + sigma_reg * sigma_loss
-        return recon_loss + sigma_reg * sigma_loss + l1_loss
+        return recon_loss + sigma_reg * sigma_loss + l1_loss + boundary_loss
 
     loss_val, grads = nnx.value_and_grad(loss_fn)(model, target)
 
     # Apply updates directly to the model state managed by optimizer
     if update:
-        optimizer.update(grads)
+        optimizer.update(model, grads)
         state = nnx.state((model, optimizer))
 
     return loss_val, grads, state
@@ -484,20 +463,21 @@ def training_step_adjustment(graphdef, state, target, projection_parameters):
     grads, _ = grads.split(params_filter, ...)
 
     # Apply updates directly to the model state managed by optimizer
-    optimizer.update(grads)
+    optimizer.update(model, grads)
     state = nnx.state((model, optimizer))
 
     return loss_val, state
 
 
-def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densify_interval=500, grad_threshold=1e-5):
+def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densify_interval=500, grad_threshold=1e-5,
+               n_init=2500):
     # Grid size
     grid_size = target_vol.shape[0]
 
     if mask is not None:
         # Extract mask coords
-        mask = sample_mask_points(mask, 2500)
-        inds = np.asarray(np.where(mask > 0.0)).T
+        mask_sampled = sample_mask_points(mask, n_init)
+        inds = np.asarray(np.where(mask_sampled > 0.0)).T
         values = target_vol[inds[:, 0], inds[:, 1], inds[:, 2]]
         factor = 0.5 * target_vol.shape[0]
         coords = (inds - factor) / factor
@@ -509,14 +489,11 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
     else:
         # Init Model
         rngs = nnx.Rngs(42)
-        model = GaussianSplatModel(n_init=2500, grid_size=grid_size, rngs=rngs)
-
-    # Masked volume
-    auto_mask = ImageHandler().generateMask(inputFn=target_vol, boxsize=64, keep_largest=True)
-    target_vol_masked = target_vol *  auto_mask
+        model = GaussianSplatModel(n_init=n_init, grid_size=grid_size, rngs=rngs)
+        mask = jnp.zeros_like(target_vol)
 
     # Init Optimizer (nnx.Optimizer automatically tracks model params)
-    optimizer = nnx.Optimizer(model, optax.adamw(learning_rate))
+    optimizer = nnx.Optimizer(model, optax.adamw(learning_rate), wrt=nnx.Param)
 
     loss_history = []
     k_history = []
@@ -534,45 +511,44 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
 
         model, _ = nnx.merge(graphdef, state)
         loss_history.append(loss_val)
-        k_history.append(model.means.value.shape[0])
-        s = float(jax.nn.softplus(model.sigma_param.value)[0])
+        k_history.append(model.means.get_value().shape[0])
+        s = float(nnx.relu(model.sigma_param.get_value())[0])
 
         # Progress bar update  (TQDM)
-        pbar.set_postfix_str(f"| Loss: {loss_val:.6f} | K: {model.means.value.shape[0]:04d} | Sigma: {s:.3f}")
+        pbar.set_postfix_str(f"| Loss: {loss_val:.6f} | K: {model.means.get_value().shape[0]:04d} | Sigma: {s:.3f}")
 
         # --- ADAPTIVE STEP ---
         if i > 0 and i % densify_interval == 0:
             # Prune threshold
-            noise_std = jnp.std(target_vol)
-            prune_threshold = 2.0 * noise_std
+            signal_std = jnp.std(target_vol, where=(mask == 1))
+            signal_mean = jnp.mean(target_vol, where=(mask == 1))
+            prune_threshold = signal_mean - signal_std
 
             # We pass the optimizer because we might need to replace it
             model, optimizer = nnx.merge(graphdef, state)
-            # current_vol = np.array(splat_volume(graphdef, state))
-            # current_mask = ImageHandler().generateMask(inputFn=current_vol, boxsize=64, keep_largest=True)
-            # current_vol *= current_mask
-            optimizer = adapt_gaussians(model, grads, target_vol_masked, optimizer=optimizer,
-                                        grad_threshold=grad_threshold, prune_threshold=0.1 * prune_threshold, k_nn=3,
-                                        std_dev_mult=2.0)
+            optimizer = adapt_gaussians(model, grads, optimizer=optimizer, grad_threshold=grad_threshold, prune_threshold=prune_threshold)
             graphdef, state = nnx.split((model, optimizer))
 
 
     model, _ = nnx.merge(graphdef, state)
 
     # FINAL PRUNING
-    means = model.means.value
-    weights = model.weights.value
+    means = model.means.get_value()
+    weights = model.weights.get_value()
 
     # Prune threshold
-    noise_std = jnp.std(target_vol)
-    prune_threshold = 2.0 * noise_std
+    signal_std = jnp.std(target_vol, where=(mask == 1))
+    signal_mean = jnp.mean(target_vol, where=(mask == 1))
+    prune_threshold = signal_mean - signal_std
 
     # Signal-aware pruning
-    keep_mask = get_pruning_mask(means, weights, prune_threshold, target_vol=target_vol, k_nn=3, std_dev_mult=2.0)
+    actual_weights = nnx.relu(weights)
+    keep_mask = actual_weights > prune_threshold
+    cc_mask = get_outlier_mask(means[keep_mask])
 
     # Filter arrays
-    means = means[keep_mask]
-    weights = weights[keep_mask]
+    means = means[keep_mask][cc_mask]
+    weights = weights[keep_mask][cc_mask]
 
     # Set final means and weights
     model.means = nnx.Param(means)
@@ -582,7 +558,7 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
 
 
 def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256, learning_rate=0.01,
-               densify_interval=200, grad_threshold=1e-5, save_partial=True):
+               densify_interval=200, grad_threshold=1e-5, save_partial=True, n_init=2500):
     # Prepare metadata
     generator = MetaDataGenerator(md_path)
     md_columns = extract_columns(generator.md)
@@ -596,7 +572,7 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
             mask = ImageHandler().generateMask(vol, boxsize=64)
 
         # Extract mask coords
-        mask = sample_mask_points(mask, 2500)
+        mask = sample_mask_points(mask, n_init)
         inds = np.asarray(np.where(mask > 0.0)).T
         values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
         factor = 0.5 * vol.shape[0]
@@ -610,7 +586,7 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
     else:
         # Init Model
         rngs = nnx.Rngs(42)
-        model = GaussianSplatModel(n_init=2500, grid_size=grid_size, rngs=rngs)
+        model = GaussianSplatModel(n_init=n_init, grid_size=grid_size, rngs=rngs)
 
     # Grain dataset
     generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
@@ -620,7 +596,7 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
     steps_per_epoch = int(len(generator.md) / batch_size)
 
     # Init Optimizer (nnx.Optimizer automatically tracks model params)
-    optimizer = nnx.Optimizer(model, optax.adamw(learning_rate))
+    optimizer = nnx.Optimizer(model, optax.adamw(learning_rate), wrt=nnx.Param)
 
     loss_history = []
     k_history = []
@@ -653,14 +629,14 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
 
             model, _ = nnx.merge(graphdef, state)
             loss_history.append(loss_val)
-            k_history.append(model.means.value.shape[0])
-            s = float(jax.nn.softplus(model.sigma_param.value)[0])
+            k_history.append(model.means.get_value().shape[0])
+            s = float(nnx.relu(model.sigma_param.get_value())[0])
 
             # Progress bar update  (TQDM)
             if len(loss_history) > 1000:
-                pbar.set_postfix_str(f"| Loss: {sum(loss_history[-1000:]) / 1000:.6f} | K: {model.means.value.shape[0]:04d} | Sigma: {s:.3f}")
+                pbar.set_postfix_str(f"| Loss: {sum(loss_history[-1000:]) / 1000:.6f} | K: {model.means.get_value().shape[0]:04d} | Sigma: {s:.3f}")
             else:
-                pbar.set_postfix_str(f"| Loss: {sum(loss_history) / len(loss_history):.6f} | K: {model.means.value.shape[0]:04d} | Sigma: {s:.3f}")
+                pbar.set_postfix_str(f"| Loss: {sum(loss_history) / len(loss_history):.6f} | K: {model.means.get_value().shape[0]:04d} | Sigma: {s:.3f}")
 
             # --- ADAPTIVE STEP ---
             if i > 0 and i % densify_interval == 0:
@@ -672,11 +648,7 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
                 prune_threshold = jnp.mean(corner_slice) + (2.0 * jnp.std(corner_slice))
 
                 model, optimizer = nnx.merge(graphdef, state)
-                current_vol = np.array(splat_volume(graphdef, state))
-                current_mask = ImageHandler().generateMask(inputFn=current_vol, boxsize=64, keep_largest=True)
-                current_vol *= current_mask
-                optimizer = adapt_gaussians(model, grads, current_vol, lr=learning_rate, grad_threshold=grad_threshold,
-                                            prune_threshold=0.1 * prune_threshold, k_nn=3, std_dev_mult=1.0)
+                optimizer = adapt_gaussians(model, grads, lr=learning_rate, grad_threshold=grad_threshold, prune_threshold=0.1 * prune_threshold)
                 graphdef, state = nnx.split((model, optimizer))
 
             # --- SAVE PARTIAL ---
@@ -688,19 +660,21 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
     model, _ = nnx.merge(graphdef, state)
 
     # FINAL PRUNING
-    means = model.means.value
-    weights = model.weights.value
+    means = model.means.get_value()
+    weights = model.weights.get_value()
 
     # Prune threshold
     corner_slice = x[:, :10, :10]
     prune_threshold = jnp.mean(corner_slice) + (2.0 * jnp.std(corner_slice))
 
     # Pruning mask
-    keep_mask = get_pruning_mask(means, weights, 0.1 * prune_threshold, k_nn=3, std_dev_mult=1.0)
+    actual_weights = nnx.relu(weights)
+    keep_mask = actual_weights > prune_threshold
+    cc_mask = get_outlier_mask(means[keep_mask])
 
     # Filter arrays
-    means = means[keep_mask]
-    weights = weights[keep_mask]
+    means = means[keep_mask][cc_mask]
+    weights = weights[keep_mask][cc_mask]
 
     # Set final means and weights
     model.means = nnx.Param(means)
