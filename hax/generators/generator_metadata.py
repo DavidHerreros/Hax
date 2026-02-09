@@ -410,9 +410,11 @@ class MetaDataGenerator:
                                  shard_size=shard_size, precision=precision, multiple_files=multiple_files)
 
     def return_grain_dataset(self, shuffle="global", batch_size=8, num_epochs=1, num_threads=1, num_workers=16,
-                             split_fraction=None):
+                             split_fraction=None, load_to_ram=False):
         import grain
         from array_record.python.array_record_data_source import ArrayRecordDataSource
+
+        self.grain_dataset_type = "RAM" if load_to_ram else self.grain_dataset_type
 
         # Get sources
         if self.grain_dataset_type == "ArrayRecord":
@@ -465,6 +467,23 @@ class MetaDataGenerator:
             shard_paths = glob(os.path.join(self.mmap_output_dir, "dataset-*"))
             shard_paths.sort()
             source = LazyNinjaGrainSource(shard_paths)
+            dataset = grain.MapDataset.source(source)
+
+        elif self.grain_dataset_type == "RAM":
+
+            images = self.load_images_to_ram(np.arange(len(self.md)))
+
+            class NumpyDataSource:
+                def __init__(self, data):
+                    self._data = data
+
+                def __len__(self):
+                    return len(self._data)
+
+                def __getitem__(self, idx):
+                    return self._data[idx], idx
+
+            source = NumpyDataSource(images)
             dataset = grain.MapDataset.source(source)
 
         else:
