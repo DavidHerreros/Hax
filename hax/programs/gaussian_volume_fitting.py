@@ -233,6 +233,8 @@ class FastVariableBlur3D(nnx.Module):
 # --- 2. FLAX NNX MODEL ---
 
 class GaussianSplatModel(nnx.Module):
+
+    @save_config
     def __init__(self, grid_size, n_init=None, manual_init=None, *, rngs: nnx.Rngs):
         self.grid_size = grid_size
 
@@ -263,6 +265,13 @@ class GaussianSplatModel(nnx.Module):
 
         # Gaussian filter
         self.gaussian_filter_3d = FastVariableBlur3D((grid_size, grid_size, grid_size))
+
+    def update_config(self):
+        if self.config["manual_init"] is None:
+            self.config["n_init"] = np.array(self.means.get_value()).shape[0]
+        else:
+            self.config["manual_init"]["means"] = np.array(self.means.get_value())
+            self.config["manual_init"]["weights"] = np.array(self.weights.get_value())
 
     def __call__(self, **kwargs):
         # Forward pass logic
@@ -554,6 +563,9 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
     model.means = nnx.Param(means)
     model.weights = nnx.Param(weights)
 
+    # Update config file
+    model.update_config()
+
     return model, k_history, loss_history
 
 
@@ -679,6 +691,9 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
     # Set final means and weights
     model.means = nnx.Param(means)
     model.weights = nnx.Param(weights)
+
+    # Update config file
+    model.update_config()
 
     return model, k_history, loss_history
 
