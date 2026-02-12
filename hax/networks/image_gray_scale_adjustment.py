@@ -15,6 +15,8 @@ from hax.utils import *
 
 
 class ImageAdjustment(nnx.Module):
+
+    @save_config
     def __init__(self, xsize, lat_dim=10, predict_value=False, *, rngs: nnx.Rngs):
         self.xsize = xsize
         self.predict_value = predict_value
@@ -372,7 +374,7 @@ def main():
 
     # Reload network
     if args.reload is not None:
-        imageAdjustment = NeuralNetworkCheckpointer.load(imageAdjustment, os.path.join(args.reload, "imageAdjustment"))
+        imageAdjustment = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "imageAdjustment"))
 
     # Train network
     if args.mode == "train":
@@ -403,7 +405,7 @@ def main():
 
         # Resume if checkpoint exists
         if os.path.isdir(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT")):
-            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"))
+            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"), optimizer)
             print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
         else:
             resume_epoch = 0
@@ -469,7 +471,7 @@ def main():
         imageAdjustment, optimizer = nnx.merge(graphdef, state)
 
         # Save model
-        NeuralNetworkCheckpointer.save(imageAdjustment, os.path.join(args.output_path, "imageAdjustment"), mode="pickle")
+        NeuralNetworkCheckpointer.save(imageAdjustment, os.path.join(args.output_path, "imageAdjustment"))
 
         # Remove checkpoint
         shutil.rmtree(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"))
