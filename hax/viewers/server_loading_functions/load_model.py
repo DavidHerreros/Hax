@@ -14,7 +14,7 @@ class HeterogeneityProgramInterface:
 
     def prepare_heterogeneity_program(self, **kwargs) -> object:
         # Load neural network (note it MUST be saved in pickle mode to make this script general)
-        model = NeuralNetworkCheckpointer.load(None, kwargs.pop("pickled_nn"), mode="pickle")
+        model = NeuralNetworkCheckpointer.load(kwargs.pop("pickled_nn"))
 
         model.HasGoodMood = types.MethodType(jax.jit(model.decode_volume), model)
 
