@@ -421,7 +421,9 @@ class MetaDataGenerator:
             shard_files = glob(os.path.join(self.mmap_output_dir, "dataset-*.arrayrecord"))
             shard_files.sort()
             sources = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
-            dataset = grain.MapDataset.source(sources)
+            dataset_train = grain.MapDataset.source(sources)
+            if split_fraction is not None:
+                dataset_val = grain.MapDataset.source(sources)
 
         elif self.grain_dataset_type == "MMAP":
             from mmap_ninja import numpy as np_ninja
@@ -467,7 +469,9 @@ class MetaDataGenerator:
             shard_paths = glob(os.path.join(self.mmap_output_dir, "dataset-*"))
             shard_paths.sort()
             source = LazyNinjaGrainSource(shard_paths)
-            dataset = grain.MapDataset.source(source)
+            dataset_train = grain.MapDataset.source(source)
+            if split_fraction is not None:
+                dataset_val = grain.MapDataset.source(source)
 
         elif self.grain_dataset_type == "RAM":
 
@@ -484,27 +488,33 @@ class MetaDataGenerator:
                     return self._data[idx], idx
 
             source = NumpyDataSource(images)
-            dataset = grain.MapDataset.source(source)
+            dataset_train = grain.MapDataset.source(source)
+            if split_fraction is not None:
+                dataset_val = grain.MapDataset.source(source)
 
         else:
             raise ValueError("Unknown grain dataset type")
 
-        if split_fraction:
-            len_dataset = int(np.ceil(len(self.md) / batch_size))
-            split_point = int(split_fraction[0] * len_dataset)
-            datasets = [dataset.slice(slice(0, split_point)), dataset.slice(slice(split_point, len_dataset))]
-        else:
-            datasets = [dataset, ]
+        if split_fraction is not None:
+            split_point = int(split_fraction[0] * len(self.md))
+            dataset_train = dataset_train[:split_point]
+            dataset_val = dataset_val[split_point:]
 
         # Shuffling type
         if shuffle == "global":
             seed = random.randint(0, 2 ** 32 - 1)
-            datasets = [dataset.shuffle(seed=seed) for dataset in datasets]
+            dataset_train = dataset_train.shuffle(seed=seed)
+            if split_fraction is not None:
+                dataset_val = dataset_val.shuffle(seed=seed)
 
             if self.grain_dataset_type == "ArrayRecord":
-                datasets = [dataset.map(parse_and_decompress) for dataset in datasets]
+                dataset_train = dataset_train.map(parse_and_decompress)
+                if split_fraction is not None:
+                    dataset_val = dataset_val.map(parse_and_decompress)
 
-            datasets = [dataset.repeat(num_epochs) for dataset in datasets]
+            dataset_train = dataset_train.repeat(num_epochs)
+            if split_fraction is not None:
+                dataset_val = dataset_val.repeat(num_epochs)
 
             if num_threads > 1:
                 read_options = grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=1)
@@ -512,70 +522,92 @@ class MetaDataGenerator:
                 read_options = None
 
 
-            datasets = [dataset.to_iter_dataset(read_options=read_options).batch(batch_size) for dataset in datasets]
+            dataset_train = dataset_train.to_iter_dataset(read_options=read_options).batch(batch_size)
+            if split_fraction is not None:
+                dataset_val = dataset_val.to_iter_dataset(read_options=read_options).batch(batch_size)
 
             if num_workers == -1:
-                performance_configs = [grain.experimental.pick_performance_config(
-                    ds=dataset,
+                performance_config = grain.experimental.pick_performance_config(
+                    ds=dataset_train,
                     ram_budget_mb=1024,
                     max_workers=None,
                     max_buffer_size=None
-                ) for dataset in datasets]
-                mp_options = [performance_config.multiprocessing_options for performance_config in performance_configs]
+                )
+                mp_options = performance_config.multiprocessing_options
             else:
-                mp_options = [grain.multiprocessing.MultiprocessingOptions(num_workers=num_workers,
-                                                                           per_worker_buffer_size=2) for _ in datasets]
-            datasets = [dataset.mp_prefetch(options=mp_options_dataset) for dataset, mp_options_dataset in zip(datasets, mp_options)]
+                mp_options = grain.multiprocessing.MultiprocessingOptions(num_workers=num_workers, per_worker_buffer_size=2)
+            dataset_train = dataset_train.mp_prefetch(options=mp_options)
+            # if split_fraction is not None:
+            #     dataset_val = dataset_val.mp_prefetch(options=mp_options)
 
         elif shuffle == "hierarchical":
             seed = random.randint(0, 2 ** 32 - 1)
 
-            datasets = [grain.experimental.WindowShuffleMapDataset(dataset, window_size=2048, seed=seed) for dataset in datasets]
+            dataset_train = grain.experimental.WindowShuffleMapDataset(dataset_train, window_size=2048, seed=seed) 
+            if split_fraction is not None:
+                dataset_val = grain.experimental.WindowShuffleMapDataset(dataset_val, window_size=2048, seed=seed) 
 
             if self.grain_dataset_type == "ArrayRecord":
-                datasets = [dataset.map(parse_and_decompress) for dataset in datasets]
+                dataset_train = dataset_train.map(parse_and_decompress)
+                if split_fraction is not None:
+                    dataset_val = dataset_val.map(parse_and_decompress)
 
-            datasets = [dataset.repeat(num_epochs) for dataset in datasets]
+            dataset_train = dataset_train.repeat(num_epochs)
+            if split_fraction is not None:
+                dataset_val = dataset_val.repeat(num_epochs)
 
             # dataset = dataset.to_iter_dataset()
 
-            datasets = [grain.experimental.InterleaveIterDataset(dataset, cycle_length=10) for dataset in datasets]
+            dataset_train = grain.experimental.InterleaveIterDataset(dataset_train, cycle_length=10)
+            if split_fraction is not None:
+                dataset_val = grain.experimental.InterleaveIterDataset(dataset_val, cycle_length=10)
 
-            datasets = [dataset.batch(batch_size) for dataset in datasets]
+            dataset_train = dataset_train.batch(batch_size)
+            if split_fraction is not None:
+                dataset_val = dataset_val.batch(batch_size)
 
             mp_options = grain.multiprocessing.MultiprocessingOptions(num_workers=16, per_worker_buffer_size=2)
-            datasets = [dataset.mp_prefetch(options=mp_options) for dataset in datasets]
+            dataset_train = dataset_train.mp_prefetch(options=mp_options)
+            # if split_fraction is not None:
+            #     dataset_val = dataset_val.mp_prefetch(options=mp_options)
 
         else:
             if self.grain_dataset_type == "ArrayRecord":
-                datasets = [dataset.map(parse_and_decompress) for dataset in datasets]
+                dataset_train = dataset_train.map(parse_and_decompress)
+                if split_fraction is not None:
+                    dataset_val = dataset_val.map(parse_and_decompress)
 
-            datasets = [dataset.repeat(num_epochs) for dataset in datasets]
+            dataset_train = dataset_train.repeat(num_epochs)
+            if split_fraction is not None:
+                dataset_val = dataset_val.repeat(num_epochs)
 
             if num_threads > 1:
                 read_options = grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=1)
             else:
                 read_options = None
 
-            datasets = [dataset.to_iter_dataset(read_options=read_options).batch(batch_size) for dataset in datasets]
+            dataset_train = dataset_train.to_iter_dataset(read_options=read_options).batch(batch_size)
+            if split_fraction is not None:
+                dataset_val = dataset_val.to_iter_dataset(read_options=read_options).batch(batch_size)
 
             if num_workers == -1:
-                performance_configs = [grain.experimental.pick_performance_config(
-                    ds=dataset,
+                performance_configs = grain.experimental.pick_performance_config(
+                    ds=dataset_train,
                     ram_budget_mb=1024,
-                    max_workers=None,
+                    max_workers=6,
                     max_buffer_size=None
-                ) for dataset in datasets]
-                mp_options = [performance_config.multiprocessing_options for performance_config in performance_configs]
+                )
+                mp_options = performance_configs.multiprocessing_options
             else:
-                mp_options = [grain.multiprocessing.MultiprocessingOptions(num_workers=num_workers,
-                                                                           per_worker_buffer_size=2) for _ in datasets]
-            datasets = [dataset.mp_prefetch(options=mp_options_dataset) for dataset, mp_options_dataset in zip(datasets, mp_options)]
+                mp_options = grain.multiprocessing.MultiprocessingOptions(num_workers=num_workers, per_worker_buffer_size=2)
+            dataset_train = dataset_train.mp_prefetch(options=mp_options)
+            # if split_fraction is not None:
+            #     dataset_val = dataset_val.mp_prefetch(options=mp_options)
 
         if split_fraction is not None:
-            return datasets
+            return dataset_train, dataset_val
         else:
-            return datasets[0]
+            return dataset_train
 
 
 def extract_columns(md, hasCTF=None, isTomo=None):
