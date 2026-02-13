@@ -315,7 +315,17 @@ class GaussianSplatModel(nnx.Module):
             else:
                 final_vol = splat_weights(self.grid_size, means, weights)
             return final_vol
+        
+        
+class GlobalAdjustment(nnx.Module):
 
+    def __init__(self):
+        self.a = nnx.Param(1.0)
+        self.b = nnx.Param(0.0)
+        
+    def __call__(self, x):
+        return nnx.relu(self.a.get_value()) * x + self.b.get_value()
+    
 
 # --- 3. ADAPTIVE LOGIC (NNX Compatible) ---
 
@@ -457,7 +467,7 @@ def training_step_images(graphdef, state, target, projection_parameters, sigma_r
 
 
 @jax.jit
-def training_step_adjustment(graphdef, state, target, projection_parameters):
+def training_step_local_adjustment(graphdef, state, target, projection_parameters):
     model, optimizer = nnx.merge(graphdef, state)
 
     def loss_fn(model, target):
@@ -470,6 +480,53 @@ def training_step_adjustment(graphdef, state, target, projection_parameters):
 
     params_filter = nnx.All(nnx.Param, nnx.PathContains('weights'))
     grads, _ = grads.split(params_filter, ...)
+
+    # Apply updates directly to the model state managed by optimizer
+    optimizer.update(model, grads)
+    state = nnx.state((model, optimizer))
+
+    return loss_val, state
+
+
+@jax.jit(static_argnames=("grid_size",))
+def training_step_global_adjustment(graphdef, state, target, projection_parameters, means, weights, sigma, grid_size):
+    model, optimizer = nnx.merge(graphdef, state)
+
+    def loss_fn(model, target, means, weights, sigma):
+        # Forward pass logic
+        weights = nnx.relu(model(weights))
+        sigma = nnx.relu(sigma)
+
+        # Precompute batch aligments
+        euler_angles = projection_parameters["euler_angles"]
+        rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
+
+        # Precompute batch shifts
+        shifts = projection_parameters["shifts"]
+
+        # Precompute batch CTFs
+        pad_factor = 1 if grid_size > 256 else 2
+        if "ctfDefocusU" in projection_parameters.keys():
+            defocusU = projection_parameters["ctfDefocusU"]
+            defocusV = projection_parameters["ctfDefocusV"]
+            defocusAngle = projection_parameters["ctfDefocusAngle"]
+            cs = projection_parameters["ctfSphericalAberration"]
+            kv = projection_parameters["ctfVoltage"][0]
+            ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                             projection_parameters["sr"],
+                             [pad_factor * grid_size, int(pad_factor * 0.5 * grid_size + 1)],
+                             rotations.shape[0], True)
+        else:
+            ctf = jnp.ones(
+                [rotations.shape[0], pad_factor * grid_size, int(pad_factor * 0.5 * grid_size + 1)],
+                dtype=means.dtype)
+
+        recon_images = splat_weights_bilinear(grid_size, means, weights, sigma, rotations, shifts, ctf)
+
+        recon_loss = jnp.mean((recon_images - target) ** 2.)
+        return recon_loss
+
+    loss_val, grads = nnx.value_and_grad(loss_fn)(model, target, means, weights, sigma)
 
     # Apply updates directly to the model state managed by optimizer
     optimizer.update(model, grads)
@@ -698,7 +755,7 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
     return model, k_history, loss_history
 
 
-def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256, learning_rate=0.01, num_epochs=3):
+def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256, learning_rate=0.01, num_epochs=3, is_global=False):
     # Prepare metadata
     generator = MetaDataGenerator(md_path)
     md_columns = extract_columns(generator.md)
@@ -710,15 +767,32 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
                                                  num_epochs=None, num_workers=8, num_threads=1)
     steps_per_epoch = int(len(generator.md) / batch_size)
 
-    # Init Optimizer (nnx.Optimizer automatically tracks model params)
-    params_filter = nnx.All(nnx.Param, nnx.PathContains('weights'))
-    optimizer = nnx.Optimizer(model, optax.adamw(learning_rate), wrt=params_filter)
+    # Global vs local
+    if is_global:
+        model_global_adjustment = GlobalAdjustment()
+
+        # Init Optimizer (nnx.Optimizer automatically tracks model params)
+        optimizer = nnx.Optimizer(model_global_adjustment, optax.adamw(learning_rate), wrt=nnx.Param)
+        graphdef, state = nnx.split((model_global_adjustment, optimizer))
+
+        # Prepare gaussian params
+        means = model.means.get_value()
+        weights = model.weights.get_value()
+        sigma = model.sigma_param.get_value()
+        grid_size = model.grid_size
+
+    else:
+        # Init Optimizer (nnx.Optimizer automatically tracks model params)
+        params_filter = nnx.All(nnx.Param, nnx.PathContains('weights'))
+        optimizer = nnx.Optimizer(model, optax.adamw(learning_rate), wrt=params_filter)
+        graphdef, state = nnx.split((model, optimizer))
 
     loss_history = []
 
-    print(f"\n{bcolors.OKCYAN}###### Adjusting gaussian weights to images... ######{bcolors.ENDC}")
-
-    graphdef, state = nnx.split((model, optimizer))
+    if is_global:
+        print(f"\n{bcolors.OKCYAN}###### Adjusting gaussian weights to images (Global version)... ######{bcolors.ENDC}")
+    else:
+        print(f"\n{bcolors.OKCYAN}###### Adjusting gaussian weights to images (Local version)... ######{bcolors.ENDC}")
 
     pbar = tqdm(range(num_epochs * steps_per_epoch), desc="Adjusting weights", file=sys.stdout, ascii=" >=", colour="green",
                 bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
@@ -737,7 +811,11 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
                                   "sr": sr}
                 projection_parameters = dict(projection_parameters, **ctf_parameters)
 
-            loss_val, state = training_step_adjustment(graphdef, state, x[..., 0], projection_parameters)
+            if is_global:
+                loss_val, state = training_step_global_adjustment(graphdef, state, x[..., 0], projection_parameters,
+                                                                  means, weights, sigma, grid_size=grid_size)
+            else:
+                loss_val, state = training_step_local_adjustment(graphdef, state, x[..., 0], projection_parameters)
 
             loss_history.append(loss_val)
 
@@ -749,7 +827,11 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
                 pbar.set_postfix_str(
                     f"| Loss: {sum(loss_history) / len(loss_history):.6f}")
 
-    model, _ = nnx.merge(graphdef, state)
+    if is_global:
+        model_global_adjustment, _ = nnx.merge(graphdef, state)
+        model.weights = nnx.Param(model_global_adjustment(weights))
+    else:
+        model, _ = nnx.merge(graphdef, state)
 
     return model, loss_history
 
