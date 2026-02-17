@@ -20,7 +20,7 @@ dependencies = ["einops<=0.8.2", "tqdm<=4.67.2", "matplotlib<=3.10.8", "numpy<=2
                 "mmap_ninja<=0.8.2", "lz4<=4.4.5", "tensorboardX<=2.6.4", "tbb<=2022.3.1", "sympy<=1.14.0", "ott-jax<=0.6.0"]
 
 [project.scripts]
-project_manager = "hax.cli:main"
+hax_project_manager = "hax.cli:main"
 
 [project.optional-dependencies]
 torch_datasets = ["torch<=2.0.1"]
