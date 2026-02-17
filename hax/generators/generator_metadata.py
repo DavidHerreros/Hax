@@ -530,15 +530,15 @@ class MetaDataGenerator:
                 performance_config = grain.experimental.pick_performance_config(
                     ds=dataset_train,
                     ram_budget_mb=1024,
-                    max_workers=None,
+                    max_workers=12,
                     max_buffer_size=None
                 )
                 mp_options = performance_config.multiprocessing_options
             else:
                 mp_options = grain.multiprocessing.MultiprocessingOptions(num_workers=num_workers, per_worker_buffer_size=2)
             dataset_train = dataset_train.mp_prefetch(options=mp_options)
-            # if split_fraction is not None:
-            #     dataset_val = dataset_val.mp_prefetch(options=mp_options)
+            if split_fraction is not None:
+                dataset_val = dataset_val.mp_prefetch(options=mp_options)
 
         elif shuffle == "hierarchical":
             seed = random.randint(0, 2 ** 32 - 1)
@@ -568,8 +568,8 @@ class MetaDataGenerator:
 
             mp_options = grain.multiprocessing.MultiprocessingOptions(num_workers=16, per_worker_buffer_size=2)
             dataset_train = dataset_train.mp_prefetch(options=mp_options)
-            # if split_fraction is not None:
-            #     dataset_val = dataset_val.mp_prefetch(options=mp_options)
+            if split_fraction is not None:
+                dataset_val = dataset_val.mp_prefetch(options=mp_options)
 
         else:
             if self.grain_dataset_type == "ArrayRecord":
@@ -594,15 +594,15 @@ class MetaDataGenerator:
                 performance_configs = grain.experimental.pick_performance_config(
                     ds=dataset_train,
                     ram_budget_mb=1024,
-                    max_workers=6,
+                    max_workers=12,
                     max_buffer_size=None
                 )
                 mp_options = performance_configs.multiprocessing_options
             else:
                 mp_options = grain.multiprocessing.MultiprocessingOptions(num_workers=num_workers, per_worker_buffer_size=2)
             dataset_train = dataset_train.mp_prefetch(options=mp_options)
-            # if split_fraction is not None:
-            #     dataset_val = dataset_val.mp_prefetch(options=mp_options)
+            if split_fraction is not None:
+                dataset_val = dataset_val.mp_prefetch(options=mp_options)
 
         if split_fraction is not None:
             return dataset_train, dataset_val
