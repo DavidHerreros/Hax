@@ -22,7 +22,7 @@ def main():
                              f"Only networks saved in Pickled format can be supplied here.")
     parser.add_argument("--output_path", required=True, type=str,
                         help=f"Path were the decoded volumes will be saved.")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     # Read latent vectors
     if args.latents_file.endswith(".txt"):
@@ -53,6 +53,3 @@ def main():
     # Save volumes to file
     for idx in range(latents.shape[0]):
         ImageHandler().write(volumes[idx], os.path.join(args.output_path, f"decoded_volume_{idx:04d}.mrc"), overwrite=True)
-
-if __name__ == "__main__":
-    main()

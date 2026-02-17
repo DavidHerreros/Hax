@@ -314,7 +314,7 @@ def main():
     parser.add_argument("--ssd_scratch_folder", required=False, type=str,
                         help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
                              f"the default disk.")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     # Check that training and validation fractions add up to one
     if sum(args.dataset_split_fraction) != 1:
@@ -474,11 +474,3 @@ def main():
 
         # Save new volume
         ImageHandler().write(adjusted_vol, os.path.join(args.output_path, "adjusted_volume.mrc"), sr=args.sr)
-
-if __name__ == "__main__":
-    import multiprocessing
-
-    # multiprocessing.set_start_method("spawn", force=True)
-    multiprocessing.set_start_method('forkserver', force=True)
-
-    main()
