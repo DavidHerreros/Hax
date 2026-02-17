@@ -488,7 +488,7 @@ def training_step_local_adjustment(graphdef, state, target, projection_parameter
     return loss_val, state
 
 
-@jax.jit(static_argnames=("grid_size",))
+@partial(jax.jit, static_argnames=("grid_size",))
 def training_step_global_adjustment(graphdef, state, target, projection_parameters, means, weights, sigma, grid_size):
     model, optimizer = nnx.merge(graphdef, state)
 
