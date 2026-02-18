@@ -536,7 +536,7 @@ def training_step_global_adjustment(graphdef, state, target, projection_paramete
 
 
 def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densify_interval=500, grad_threshold=1e-5,
-               n_init=2500):
+               n_init=2500, fixed_gaussians=False):
     # Grid size
     grid_size = target_vol.shape[0]
 
@@ -584,7 +584,7 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
         pbar.set_postfix_str(f"| Loss: {loss_val:.6f} | K: {model.means.get_value().shape[0]:04d} | Sigma: {s:.3f}")
 
         # --- ADAPTIVE STEP ---
-        if i > 0 and i % densify_interval == 0:
+        if i > 0 and i % densify_interval == 0 and not fixed_gaussians:
             # Prune threshold
             signal_std = jnp.std(target_vol, where=(mask == 1))
             signal_mean = jnp.mean(target_vol, where=(mask == 1))
