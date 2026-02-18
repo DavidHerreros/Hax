@@ -15,14 +15,14 @@ from hax.utils.loggers import bcolors
 class Deconvolver(nnx.Module):
     def __init__(self, lat_dim=10, n_layers=3, *, rngs: nnx.Rngs):
         self.lat_dim = lat_dim
-        self.normal_key = rngs.distributions()
 
-        self.hidden_layers = [nnx.Linear(lat_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers = [nnx.Linear(lat_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         for _ in range(n_layers):
-            self.hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_layers.append(nnx.Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        hidden_layers.append(nnx.Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
         for _ in range(2):
-            self.hidden_layers.append(nnx.Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(nnx.Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers = nnx.List(hidden_layers)
         self.latent = nnx.Linear(256, lat_dim, rngs=rngs, kernel_init=jax.nn.initializers.uniform(0.0001))
 
     def __call__(self, x):
@@ -131,7 +131,7 @@ def train_deconv_step(graphdef, state, x, cov, z_space, islog=False, fraction=No
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=False)
     loss, grads = grad_fn(model, x, d, cov, kde.covariance, z_space)
 
-    optimizer_deconv.update(grads)
+    optimizer_deconv.update(model, grads)
 
     state = nnx.state((model, optimizer_deconv))
 
@@ -148,6 +148,7 @@ def main():
     from sklearn.decomposition import PCA
     import argparse
     import optax
+    from contextlib import closing
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import NumpyGenerator
     from hax.networks import train_deconv_step
@@ -176,7 +177,7 @@ def main():
                         help="Path to save the results (trained neural network, deconvolved latents...)")
     parser.add_argument("--reload", required=False, type=str,
                         help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     # Prepare data
     latents = np.load(args.latents)
@@ -189,7 +190,7 @@ def main():
 
     # Reload network
     if args.reload is not None:
-        deconvolver = NeuralNetworkCheckpointer.load(deconvolver, os.path.join(args.reload, "deconvolver"))
+        deconvolver = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "deconvolver"))
 
     # Train network
     if args.mode == "train":
@@ -205,25 +206,36 @@ def main():
         covariances = covariances[idx]
 
         # Prepare data loader
-        data_loader = NumpyGenerator(latents).return_tf_dataset(shuffle=True, preShuffle=True,
-                                                                batch_size=args.batch_size, prefetch=20)
+        data_loader = NumpyGenerator(latents).return_grain_dataset(batch_size=args.batch_size, shuffle=True,
+                                                                   preShuffle=True, num_workers=-1, num_epochs=None)
+        steps_per_epoch = int(int(args.dataset_split_fraction[0] * latents.shape[0]) / args.batch_size)
 
         # Optimizers
-        optimizer = nnx.Optimizer(deconvolver, optax.adam(1e-6))
+        optimizer = nnx.Optimizer(deconvolver, optax.adam(1e-6), wrt=nnx.Param)
         graphdef, state = nnx.split((deconvolver, optimizer))
 
         # Training loop
         print(f"{bcolors.OKCYAN}\n###### Training deconvolution... ######")
-        for i in range(args.epochs):
-            total_loss = 0
 
-            # For progress bar (TQDM)
-            step = 1
-            print(f'\nTraining epoch {i + 1}/{args.epochs} |')
-            pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=",
-                        colour="green")
+        i = 0
+        pbar = tqdm(range(steps_per_epoch, args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=",
+                    colour="green",
+                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
-            for (x, _) in pbar:
+        with closing(iter(data_loader)) as iter_data_loader:
+            for total_steps in pbar:
+                (x, _) = next(iter_data_loader)
+
+                if total_steps % steps_per_epoch == 0:
+
+                    total_loss = 0
+
+                    # For progress bar (TQDM)
+                    step = 1
+                    pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
+
+                    i += 1
+
                 loss, state = train_deconv_step(graphdef, state, x, covariances, latents, islog=True,
                                                 subsetMode="random", fraction=50000)
                 total_loss += loss
@@ -241,26 +253,26 @@ def main():
         deconvolver.eval()
 
         # Prepare data loader
-        data_loader = NumpyGenerator(latents).return_tf_dataset(shuffle=False, preShuffle=False,
-                                                                batch_size=args.batch_size, prefetch=20)
+        data_loader = NumpyGenerator(latents).return_grain_dataset(batch_size=args.batch_size, shuffle=False,
+                                                                   preShuffle=False, num_workers=0, num_epochs=1)
+        steps_per_epoch = int(int(args.dataset_split_fraction[0] * latents.shape[0]) / args.batch_size)
 
         # Jitted prediciton function
         predict_fn = jax.jit(deconvolver.__call__)
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting deconvolved latents... ######")
-        latents_deconv = []
-        for i in range(args.epochs):
-            # For progress bar (TQDM)
-            pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=",
-                        colour="green")
 
-            for (x, labels) in pbar:
+        pbar = tqdm(range(steps_per_epoch, args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=",
+                    colour="green",
+                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+
+        latents_deconv = []
+        with closing(iter(data_loader)) as iter_data_loader:
+            for _ in pbar:
+                (x, labels) = next(iter_data_loader)
                 latents_deconv.append(predict_fn(x))
         latents_deconv = np.asarray(latents_deconv)
 
         # Save new latents
         np.save(os.path.join(args.output_path, "latents_deconvolved.npy"), latents_deconv)
-
-if __name__ == "__main__":
-    main()
