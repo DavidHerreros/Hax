@@ -107,7 +107,7 @@ class ArrayListGenerator:
     def return_grain_dataset(self, preShuffle=False, shuffle=True, batch_size=8, num_epochs=None, num_threads=1, num_workers=4):
         import grain
 
-        idx = np.arange(self.data.shape[0])
+        idx = np.arange(self.data[0].shape[0])
         if preShuffle:
             np.random.shuffle(idx)
             data = [data[idx] for data in self.data]
@@ -119,10 +119,10 @@ class ArrayListGenerator:
                 self._data = data
 
             def __len__(self):
-                return len(self._data)
+                return self._data[0].shape[0]
 
             def __getitem__(self, idx):
-                return [np_array[idx] for np_array in self.data], idx
+                return [np_array[idx] for np_array in self._data], idx
 
         source = ListDataSource(data)
         dataset = grain.MapDataset.source(source)
