@@ -88,10 +88,10 @@ def main():
                              f"to monitor and/or measure memory usage and adjust this value")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the estimated covariances")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     # Load neural network (note it MUST be saved in pickle mode to make this script general)
-    model = NeuralNetworkCheckpointer.load(None, args.pickled_nn, mode="pickle")
+    model = NeuralNetworkCheckpointer.load(args.pickled_nn)
 
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
@@ -117,6 +117,3 @@ def main():
     # Save covariances
     np.save(os.path.join(args.output_path, "covariance_matrices.npy"), covariances)
     np.save(os.path.join(args.output_path, "latents.npy"), latents)
-
-if __name__ == "__main__":
-    main()

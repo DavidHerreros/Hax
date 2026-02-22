@@ -1279,7 +1279,7 @@ def main():
             # you can pass any arguments to add_argument
             parser.add_argument(arg.split('=')[0], type=float_or_str)
 
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     # Read and generate data
     if pathlib.Path(args.z_space).suffix == ".txt":
@@ -1317,6 +1317,3 @@ def main():
 
     # Initialize volume slicer
     Annotate3D(**input_dict)
-
-if __name__ == "__main__":
-    main()

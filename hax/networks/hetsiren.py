@@ -13,6 +13,7 @@ from einops import rearrange
 
 from hax.utils import *
 from hax.layers import *
+from hax.programs import splat_weights_trilinear, FastVariableBlur3D
 
 
 def mse(a, b):
@@ -26,35 +27,39 @@ class Encoder(nnx.Module):
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 4))
         self.architecture = architecture
         self.isVae = isVae
-        self.normal_key = rngs.distributions()
 
         if self.architecture == "mlpnn":
-            self.hidden_layers = [Linear(self.input_dim * self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+            hidden_layers = [Linear(self.input_dim * self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
             for _ in range(n_layers):
-                self.hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-            self.hidden_layers.append(Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
+                hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
             for _ in range(2):
-                self.hidden_layers.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+                hidden_layers.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+            self.hidden_layers = nnx.List(hidden_layers)
+            # self.hidden_layers = hidden_layers
             self.latent = Linear(256, lat_dim, rngs=rngs)
 
         elif self.architecture == "convnn":
-            self.hidden_layers_conv = [Linear(self.input_dim * self.input_dim, self.input_conv_dim * self.input_conv_dim, rngs=rngs, dtype=jnp.bfloat16)]
-            self.hidden_layers_conv.append(Conv(1, 4, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-            self.hidden_layers_conv.append(Conv(4, 8, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-            self.hidden_layers_conv.append(Conv(8, 8, kernel_size=(1, 1), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-            self.hidden_layers_conv.append(Conv(8, 8, kernel_size=(1, 1), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-            self.hidden_layers_conv.append(Conv(8, 16, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-            self.hidden_layers_conv.append(Conv(16, 16, kernel_size=(1, 1), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-            self.hidden_layers_conv.append(Conv(16, 16, kernel_size=(1, 1), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-            self.hidden_layers_conv.append(Conv(16, 16, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_conv = [Linear(self.input_dim * self.input_dim, self.input_conv_dim * self.input_conv_dim, rngs=rngs, dtype=jnp.bfloat16)]
+            hidden_layers_conv.append(Conv(1, 4, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_conv.append(Conv(4, 8, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_conv.append(Conv(8, 8, kernel_size=(1, 1), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_conv.append(Conv(8, 8, kernel_size=(1, 1), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_conv.append(Conv(8, 16, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_conv.append(Conv(16, 16, kernel_size=(1, 1), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_conv.append(Conv(16, 16, kernel_size=(1, 1), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_conv.append(Conv(16, 16, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            self.hidden_layers_conv = nnx.List(hidden_layers_conv)
 
-            self.hidden_layers_linear = [Linear(16 * self.out_conv_dim * self.out_conv_dim, 256, rngs=rngs, dtype=jnp.bfloat16)]
+            hidden_layers_linear = [Linear(16 * self.out_conv_dim * self.out_conv_dim, 256, rngs=rngs, dtype=jnp.bfloat16)]
             for _ in range(3):
-                self.hidden_layers_linear.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+                hidden_layers_linear.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
 
-            self.hidden_layers_linear.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_linear.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
             for _ in range(2):
-                self.hidden_layers_linear.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+                hidden_layers_linear.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+
+            self.hidden_layers_linear = nnx.List(hidden_layers_linear)
 
             if isVae:
                 self.mean_x = Linear(256, lat_dim, rngs=rngs)
@@ -65,10 +70,10 @@ class Encoder(nnx.Module):
         else:
             raise ValueError("Architecture not supported. Implemented architectures are: mlpnn / convnn")
 
-    def sample_gaussian(self, mean, logstd):
-        return logstd * jnr.normal(self.normal_key, shape=mean.shape) + mean
+    def sample_gaussian(self, mean, logstd, *, rngs):
+        return logstd * jnr.normal(rngs, shape=mean.shape) + mean
 
-    def __call__(self, x, return_last=False):
+    def __call__(self, x, return_last=False, *, rngs=None):
         if self.architecture == "mlpnn":
             x = rearrange(x, 'b h w c -> b (h w c)')
 
@@ -106,7 +111,7 @@ class Encoder(nnx.Module):
             if self.isVae:
                 mean = self.mean_x(x)
                 logstd = self.logstd_x(x)
-                sample = self.sample_gaussian(mean, logstd)
+                sample = self.sample_gaussian(mean, logstd, rngs=rngs) if rngs is not None else mean
                 return sample, mean, logstd
             else:
                 latent = self.latent(x)
@@ -116,14 +121,14 @@ class EncoderTomo(nnx.Module):
     def __init__(self, input_dim, lat_dim=10, n_layers=3, isVae=False, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.isVae = isVae
-        self.normal_key = rngs.distributions()
 
-        self.hidden_layers = [Linear(self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers = [Linear(self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         for _ in range(n_layers):
-            self.hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_layers.append(Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        hidden_layers.append(Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
         for _ in range(2):
-            self.hidden_layers.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers = nnx.List(hidden_layers)
         self.latent = Linear(256, lat_dim, rngs=rngs)
 
         if isVae:
@@ -132,10 +137,10 @@ class EncoderTomo(nnx.Module):
         else:
             self.latent = Linear(256, lat_dim, rngs=rngs)
 
-    def sample_gaussian(self, mean, logstd):
-        return logstd * jnr.normal(self.normal_key, shape=mean.shape) + mean
+    def sample_gaussian(self, mean, logstd, *, rngs):
+        return logstd * jnr.normal(rngs, shape=mean.shape) + mean
 
-    def __call__(self, x, return_last=False):
+    def __call__(self, x, return_last=False, *, rngs=None):
         for layer in self.hidden_layers:
             x = nnx.relu(layer(x))
 
@@ -145,7 +150,7 @@ class EncoderTomo(nnx.Module):
             if self.isVae:
                 mean = self.mean_x(x)
                 logstd = self.logstd_x(x)
-                sample = self.sample_gaussian(mean, logstd)
+                sample = self.sample_gaussian(mean, logstd, rngs=rngs) if rngs is not None else mean
                 return sample, mean, logstd
             else:
                 latent = self.latent(x)
@@ -154,12 +159,11 @@ class EncoderTomo(nnx.Module):
 class MultiEncoder(nnx.Module):
     def __init__(self, input_dim, lat_dim=10, n_layers=3, isVae=False, architecture="convnn", isTomoSIREN=False, *, rngs: nnx.Rngs):
         if isTomoSIREN:
-            self.encoders = {"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, architecture=architecture, rngs=rngs),
-                             "encoder_dec": EncoderTomo(100, lat_dim, n_layers=n_layers, rngs=rngs)}
+            self.encoders = nnx.Dict({"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, architecture=architecture, rngs=rngs),
+                                      "encoder_dec": EncoderTomo(100, lat_dim, n_layers=n_layers, rngs=rngs)})
         else:
-            self.encoders = {"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, architecture=architecture, rngs=rngs),
-                             "encoder_dec": Encoder(input_dim, lat_dim, n_layers=n_layers, architecture=architecture, rngs=rngs)}
-        self.normal_key = rngs.distributions()
+            self.encoders = nnx.Dict({"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, architecture=architecture, rngs=rngs),
+                                      "encoder_dec": Encoder(input_dim, lat_dim, n_layers=n_layers, architecture=architecture, rngs=rngs)})
         self.isVae = isVae
         if isVae:
             self.mean_x = Linear(256, lat_dim, rngs=rngs)
@@ -168,28 +172,27 @@ class MultiEncoder(nnx.Module):
             self.latent = Linear(256, lat_dim, rngs=rngs)
 
         # Hidden layers latent space
-        self.hidden_layers_latent = [Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers_latent = [Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16)]
         for _ in range(2):
-            self.hidden_layers_latent.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_latent.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_latent = nnx.List(hidden_layers_latent)
 
         # Hidden layer refinement
-        self.hidden_layers_refinement = [Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers_refinement = [Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16)]
         for _ in range(2):
-            self.hidden_layers_refinement.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_refinement.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_refinement = nnx.List(hidden_layers_refinement)
 
         # Rigid registration of volumes
-        self.rigid_6d_rotation = nnx.Linear(256, 6, rngs=rngs)
+        self.rigid_6d_rotation = nnx.Linear(256, 6, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
         self.rotations_logsig = nnx.Linear(256, 3, rngs=rngs)
-        self.rigid_shifts = nnx.Linear(256, 3, rngs=rngs)
+        self.rigid_shifts = nnx.Linear(256, 3, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
 
-        # Refinement control (residual learning)
-        self.alpha_rigid_rotations = nnx.Param(1e-4)
-        self.alpha_rigid_shifts = nnx.Param(1e-4)
+    def sample_gaussian(self, mean, logstd, *, rngs):
+        return logstd * jnr.normal(rngs, shape=mean.shape) + mean
 
-    def sample_gaussian(self, mean, logstd):
-        return logstd * jnr.normal(self.normal_key, shape=mean.shape) + mean
-
-    def __call__(self, x, encoder_id="encoder_exp", return_last=False, return_alignment_refinement=False):
+    def __call__(self, x, encoder_id="encoder_exp", return_last=False, return_alignment_refinement=False, *,
+                 rngs=None):
         x = self.encoders[encoder_id](x, return_last=True)
 
         if return_alignment_refinement:
@@ -200,13 +203,12 @@ class MultiEncoder(nnx.Module):
             # Estimate rotations for volume registration
             rotations_6d = self.rigid_6d_rotation(x_ref)
             identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
-            rotations_6d = identity_6d + self.alpha_rigid_rotations * rotations_6d
+            rotations_6d = identity_6d + rotations_6d
             rotations_rigid = PoseDistMatrix.mode_rotmat(rotations_6d)
             rotations_logscale = self.rotations_logsig(x_ref)
 
             # Estimate shifts for volume registration
-            shifts_rigid = self.alpha_rigid_shifts * self.rigid_shifts(x_ref)
-            # shifts_rigid = self.rigid_shifts(x_ref)
+            shifts_rigid = self.rigid_shifts(x_ref)
 
         for layer in self.hidden_layers_latent:
             x = nnx.leaky_relu(x + layer(x))  # or nnx.relu
@@ -214,7 +216,7 @@ class MultiEncoder(nnx.Module):
         if self.isVae:
             mean = self.mean_x(x)
             logstd = self.logstd_x(x)
-            sample = self.sample_gaussian(mean, logstd)
+            sample = self.sample_gaussian(mean, logstd, rngs=rngs) if rngs is not None else mean
             if return_last:
                 if return_alignment_refinement:
                     return (sample, mean, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), x
@@ -240,21 +242,33 @@ class MultiEncoder(nnx.Module):
 
 
 class DeltaVolumeDecoder(nnx.Module):
-    def __init__(self, total_voxels, lat_dim, volume_size, inds, reference_values, transport_mass=False, *, rngs: nnx.Rngs):
+    def __init__(self, total_voxels, lat_dim, volume_size, coords, reference_values, transport_mass=False, is_implicit=True, *, rngs: nnx.Rngs):
         self.volume_size = volume_size
-        self.inds = inds
-        self.reference_values = reference_values
+        self.reference_values = reference_values[None, ...]
         self.total_voxels = total_voxels
         self.transport_mass = transport_mass
+        self.is_implicit = is_implicit
 
         # Indices to (normalized) coords
-        self.factor = 0.5 * volume_size
-        coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)[None, ...]
-        self.coords = (coords - self.factor) / self.factor
+        mins, maxs = coords.min(axis=0), coords.max(axis=0)
+        self.centering = 0.5 * (mins + maxs)[None, None, ...]
+        self.scale = 0.5 * max(maxs[0] - mins[0], maxs[1] - mins[1], maxs[2] - mins[2])
+        self.coords = ((coords[None, ...] - self.centering) / self.scale)
+
+        # Scale value for SIREN2
+        inds = jnp.stack([coords[:, 2], coords[:, 1], coords[:, 0]], axis=1)
+        coords_for_psi = (inds - 0.5 * volume_size) / (0.5 * volume_size)
+        vol_for_psi = splat_weights_trilinear(volume_size, coords_for_psi, reference_values)
+        vol_for_psi = FastVariableBlur3D((volume_size, volume_size, volume_size))(vol_for_psi[None, ..., None], sigma=1.0)[0, ..., 0]
+        psi = calculate_spectral_centroid_3d(vol_for_psi)
+        s0 = 2.0 * (1. - jnp.exp(-5. * psi))
+        s1 = 0.5 * psi
 
         # Graph from coordinates
         if not jnp.all(reference_values == 0) and transport_mass:
-            self.edge_index, _ = build_graph_from_coordinates(self.coords[0], k=2, radius_factor=1.5)
+            # Graph from reference
+            self.edge_index, self.edge_weights, self.consensus_distances, self.tau, _, _ = build_graph_from_coordinates(self.coords[0], k_spacing=2, k_knn=6, radius_factor=1.5)
+            self.edge_weights = jnp.ones_like(self.edge_weights)
 
         # Delta volume decoder (TODO: Check and fix hypernetwork - compare with TF implementation)
         # self.hidden_linear = [HyperLinear(in_features=lat_dim, out_features=8, in_hyper_features=lat_dim, hidden_hyper_features=8, rngs=rngs, dtype=jnp.bfloat16)]
@@ -263,46 +277,99 @@ class DeltaVolumeDecoder(nnx.Module):
         # self.hidden_linear.append(HyperLinear(in_features=8, out_features=8, in_hyper_features=8, hidden_hyper_features=8, rngs=rngs, dtype=jnp.bfloat16))
 
         if transport_mass:
-            self.hidden_coords = [Linear(in_features=lat_dim // 2, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
-            for _ in range(4):
-                self.hidden_coords.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
-            self.hidden_coords.append(Linear(in_features=8, out_features=3 * total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
+            if self.is_implicit:
+                # Implicit version
+                hidden_coords = [Siren2Linear(in_features=lat_dim // 2 + 3, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=True, w0=30.0, s=s0)]
+                hidden_coords.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, w0=1.0, s=s1))
+                for _ in range(7):
+                    hidden_coords.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, w0=1.0, s=0.0))
+                hidden_coords.append(nnx.Linear(in_features=32, out_features=3, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init()))
 
-            self.hidden_values = [Linear(in_features=lat_dim // 2, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
-            for _ in range(4):
-                self.hidden_values.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
-            self.hidden_values.append(Linear(in_features=8, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
+                hidden_values = [Siren2Linear(in_features=lat_dim // 2 + 3, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=True, w0=30.0, s=s0)]
+                hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, w0=1.0, s=s1))
+                for _ in range(7):
+                    hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, w0=1.0, s=0.0))
+                hidden_values.append(nnx.Linear(in_features=32, out_features=1, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init()))
+
+            else:
+                # Standard version
+                hidden_coords = [Siren2Linear(in_features=lat_dim // 2, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=True, w0=30.0, s=s0)]
+                hidden_coords.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, custom_init=False, is_residual=True, w0=1.0, s=s1))
+                for _ in range(7):
+                    hidden_coords.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, custom_init=False, is_residual=True, w0=1.0, s=0.0))
+                hidden_coords.append(Linear(in_features=32, out_features=3 * total_voxels, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init()))
+
+                hidden_values = [Siren2Linear(in_features=lat_dim // 2, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=True, w0=30.0, s=s0)]
+                hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, custom_init=False, is_residual=True, w0=1.0, s=s1))
+                for _ in range(7):
+                    hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, custom_init=False, is_residual=True, w0=1.0, s=0.0))
+                hidden_values.append(Linear(in_features=32, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init()))
+
+            self.hidden_values = nnx.List(hidden_values)
+            self.hidden_coords = nnx.List(hidden_coords)
+
         else:
-            self.hidden_values = [Linear(in_features=lat_dim, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
+            self.is_implicit = False
+            hidden_values = [Linear(in_features=lat_dim, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
             for _ in range(4):
-                self.hidden_values.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
-            self.hidden_values.append(Linear(in_features=8, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
+                hidden_values.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
+            hidden_values.append(Linear(in_features=8, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
 
-    def __call__(self, x):
+            self.hidden_values = nnx.List(hidden_values)
+
+    def __call__(self, x, c=None):
         if self.transport_mass:
-            x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=1)
+            if self.is_implicit:
+                # Positional encoding of coords
+                if c is None:
+                    c = self.coords[0]
+                c = jnp.tile(c[None, ...], (x.shape[0], 1, 1))
 
-            # Decode values
-            x_map = jnp.sin(30.0 * self.hidden_values[0](x_map))
-            for layer in self.hidden_values[1:-1]:
-                x_map = jnp.sin(x_map + 1.0 * layer(x_map))
-            x_map = self.hidden_values[-1](x_map)
+                # Adjust latents
+                x = jnp.tile(x[:, None, ...], (1, c.shape[1], 1))
 
-            # Decode coords
-            x_coords = jnp.sin(30.0 * self.hidden_coords[0](x_coords))
-            for layer in self.hidden_coords[1:-1]:
-                x_coords = jnp.sin(x_coords + 1.0 * layer(x_coords))
-            x_coords = self.hidden_coords[-1](x_coords)
+                x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=-1)
 
-            # Extract delta_coords and values
-            x_coords = jnp.reshape(x_coords, (x.shape[0], self.total_voxels, 3))
+                # Join coords and latents
+                x_coords = jnp.concatenate([x_coords, c], axis=-1)
+                x_map = jnp.concatenate([x_map, c], axis=-1)
+
+                # Decode values
+                x_map = self.hidden_values[0](x_map)
+                for layer in self.hidden_values[1:-1]:
+                    x_map = layer(x_map)
+                x_map = self.hidden_values[-1](x_map)[..., 0]
+
+                # Decode coords
+                x_coords = self.hidden_coords[0](x_coords)
+                for layer in self.hidden_coords[1:-1]:
+                    x_coords = layer(x_coords)
+                x_coords = self.hidden_coords[-1](x_coords)
+
+            else:
+                x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=1)
+
+                # Decode values
+                x_map = self.hidden_values[0](x_map)
+                for layer in self.hidden_values[1:-1]:
+                    x_map = layer(x_map)
+                x_map = self.hidden_values[-1](x_map)
+
+                # Decode coords
+                x_coords = self.hidden_coords[0](x_coords)
+                for layer in self.hidden_coords[1:-1]:
+                    x_coords = layer(x_coords)
+                x_coords = self.hidden_coords[-1](x_coords)
+
+                x_coords = jnp.reshape(x_coords, (x.shape[0], self.total_voxels, 3))
+
             delta_coords, delta_values = x_coords, x_map
 
             # Recover volume values
             values = nnx.relu(self.reference_values + delta_values)
 
             # Recover coords (non-normalized)
-            coords = self.factor * (self.coords + delta_coords)
+            coords = self.scale * (self.coords + delta_coords)
         else:
             # Decode voxel values
             x = jnp.sin(30.0 * self.hidden_values[0](x))
@@ -316,11 +383,11 @@ class DeltaVolumeDecoder(nnx.Module):
             values = self.reference_values + x_map
 
             # Recover coords (non-normalized)
-            coords = self.factor * self.coords
+            coords = self.scale * self.coords
 
         return coords, values
 
-    def decode_volume(self, x=None, coords_values=None, filter=True):
+    def decode_volume(self, x=None, coords_values=None, filter=True, sigma=1.0):
         if x is not None:
             # Decode volume values
             coords, values = self.__call__(x)
@@ -330,7 +397,7 @@ class DeltaVolumeDecoder(nnx.Module):
             raise ValueError("Please provide either x or coords_value parameter")
 
         # Displace coordinates
-        coords = coords + self.factor
+        coords = coords + self.centering
 
         # Place values on grid
         grids = jnp.zeros((values.shape[0], self.volume_size, self.volume_size, self.volume_size))
@@ -364,19 +431,23 @@ class DeltaVolumeDecoder(nnx.Module):
 
         # Filter volume
         if filter:
-            grids = jax.vmap(low_pass_3d)(grids)
+            grids = jax.vmap(low_pass_3d, in_axes=(0, None))(grids, sigma)
 
         return grids
 
 class PhysDecoder:
-    def __init__(self, xsize, transport_mass):
+    def __init__(self, xsize, sr, transport_mass):
         self.xsize = xsize
         self.transport_mass = transport_mass
+        # self.pad_factor = 1 if xsize > 256 else 2
+        self.pad_factor = 2
 
-    def __call__(self, x, values, coords, xsize, rotations, shifts, ctf, ctf_type, filter=True):
-        # Volume factor
-        factor = 0.5 * xsize
+        physical_radius_px = 60.0 / sr
+        max_safe_radius_px = xsize // 8
+        dilation_radius = jnp.minimum(physical_radius_px, max_safe_radius_px)
+        self.dilation_radius = int(jnp.maximum(dilation_radius, 5))
 
+    def __call__(self, x, values, coords, xsize, rotations, shifts, centering, ctf, ctf_type, sigma, bg_weight=1.0, filter=True):
         # Get rotation matrices
         if rotations.ndim == 2:
             rotations = euler_matrix_batch(rotations[:, 0], rotations[:, 1], rotations[:, 2])
@@ -384,7 +455,7 @@ class PhysDecoder:
         coords = jnp.matmul(coords, rearrange(rotations, "b r c -> b c r"))
 
         # Apply shifts
-        coords = coords[..., :-1] - shifts[:, None, :] + factor
+        coords = coords[..., :-1] - shifts[:, None, :] + centering[..., :-1]
 
         # Scatter image
         B = x.shape[0]
@@ -417,18 +488,41 @@ class PhysDecoder:
 
         # Gaussian filter (needed by forward interpolation)
         if filter:
-            images = dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3)[..., 0]
+            images = dm_pix.gaussian_blur(images[..., None], sigma, kernel_size=9)[..., 0]
+
+        # Define weighted mask for losses
+        images_mask = jnp.where(images > 1e-6, 1.0, 0.0)
 
         # Apply CTF
         if ctf_type in ["apply" or "wiener" or "squared"]:
-            images = ctfFilter(images, ctf, pad_factor=2)
+            images = ctfFilter(images, ctf, pad_factor=self.pad_factor)
 
-        return images
+            # Weighted mask (CTF case)
+            kernel_size = 2 * self.dilation_radius + 1
+            images_mask = images_mask[..., None].astype(x.dtype)
+            images_mask_vert = jax.lax.reduce_window(
+                images_mask, -jnp.inf, jax.lax.max,
+                window_dimensions=(1, kernel_size, 1, 1),
+                window_strides=(1, 1, 1, 1), padding='SAME'
+            )
+            images_mask = jax.lax.reduce_window(
+                images_mask_vert, -jnp.inf, jax.lax.max,
+                window_dimensions=(1, 1, kernel_size, 1),
+                window_strides=(1, 1, 1, 1), padding='SAME'
+            )
+            images_mask = images_mask[..., 0]
+
+        # Final weighted mask
+        images_mask = jnp.where(images_mask == 0.0, bg_weight, 1.0)
+
+        return images, images_mask
 
 class HetSIREN(nnx.Module):
-    def __init__(self, lat_dim, reference_volume, reconstruction_mask, xsize, sr, bank_size=10000, ctf_type="apply",
-                 decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
-                 isTomoSIREN=False, *, rngs: nnx.Rngs):
+
+    @save_config
+    def __init__(self, lat_dim, reference_volume, reconstruction_mask, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
+                 sigma=1.0, decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
+                 is_implicit=True, isTomoSIREN=False, *, rngs: nnx.Rngs):
         super(HetSIREN, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -439,21 +533,18 @@ class HetSIREN(nnx.Module):
         self.local_reconstruction = local_reconstruction
         self.reference_volume = reference_volume
         self.reconstruction_mask = reconstruction_mask.astype(float)
-        self.inds = jnp.asarray(jnp.where(reconstruction_mask > 0.0)).T
+        self.coords = jnp.array(coords)
         self.lat_dim = lat_dim
-        reference_values = reference_volume[self.inds[..., 0], self.inds[..., 1], self.inds[..., 2]][None, ...]
         self.has_reference_volume = not bool(np.all(reference_volume == 0.0))
         self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, architecture=architecture, isTomoSIREN=isTomoSIREN, rngs=rngs) \
             if decoupling or isTomoSIREN else Encoder(self.xsize, lat_dim, isVae=isVae, architecture=architecture, rngs=rngs)
-        self.delta_volume_decoder = DeltaVolumeDecoder(self.inds.shape[0], lat_dim, self.xsize, self.inds, reference_values, transport_mass=transport_mass, rngs=rngs)
-        self.delta_volume_decoder_rigid = DeltaVolumeDecoder(self.inds.shape[0], lat_dim, self.xsize, self.inds, reference_values, transport_mass=True, rngs=rngs)
+        self.delta_volume_decoder = DeltaVolumeDecoder(self.coords.shape[0], lat_dim, self.xsize, self.coords, values, transport_mass=transport_mass, is_implicit=is_implicit, rngs=rngs)
 
-        self.phys_decoder = PhysDecoder(self.xsize, transport_mass=transport_mass)
+        self.phys_decoder = PhysDecoder(self.xsize, sr, transport_mass=transport_mass)
 
         #### Memory bank for latent spaces ####
         self.bank_size = bank_size
         self.subset_size = min(2048, bank_size)
-        self.choice_key = rngs.choice()
 
         self.memory_bank = nnx.Variable(
             jnp.zeros((self.bank_size, lat_dim))
@@ -462,21 +553,24 @@ class HetSIREN(nnx.Module):
             jnp.zeros((1,), dtype=jnp.int32)
         )
 
-    def __call__(self, x, **kwargs):
+        # Gaussians size
+        self.sigma = nnx.Param(sigma)
+
+    def __call__(self, x, rngs=None, **kwargs):
         if self.isVae:
             if self.decoupling:
-                (sample, mean, _), (rotations, shifts, _) = self.encoder(x, "encoder_exp", return_last=False, return_alignment_refinement=True)
+                (sample, mean, _), (rotations, shifts, _) = self.encoder(x, "encoder_exp", return_last=False, return_alignment_refinement=True, rngs=rngs)
             else:
-                (sample, mean, _), (rotations, shifts, _) = self.encoder(x, return_last=False, return_alignment_refinement=True)
+                (sample, mean, _), (rotations, shifts, _) = self.encoder(x, return_last=False, return_alignment_refinement=True, rngs=rngs)
             if kwargs.pop("gaussian_sample", False):
                 latent = sample
             else:
                 latent = mean
         else:
             if self.decoupling:
-                latent, (rotations, shifts, _)  = self.encoder(x, "encoder_exp", return_last=False, return_alignment_refinement=True)
+                latent, (rotations, shifts, _)  = self.encoder(x, "encoder_exp", return_last=False, return_alignment_refinement=True, rngs=rngs)
             else:
-                latent, (rotations, shifts, _) = self.encoder(x, return_last=False, return_alignment_refinement=True)
+                latent, (rotations, shifts, _) = self.encoder(x, return_last=False, return_alignment_refinement=True, rngs=rngs)
         if kwargs.pop("return_alignment_refinement", True):
             return latent, (rotations, shifts)
         else:
@@ -485,7 +579,7 @@ class HetSIREN(nnx.Module):
     # --- Method for enqueuing to the memory bank ---
     def enqueue(self, keys_to_add):
         """Updates the memory bank and pointer using JIT-compatible operations."""
-        ptr = self.memory_bank_ptr.value[0]
+        ptr = self.memory_bank_ptr.get_value()[0]
 
         # Define the starting position for the update.
         # It must be a tuple with one index per dimension of the array.
@@ -494,9 +588,9 @@ class HetSIREN(nnx.Module):
 
         # Use `lax.dynamic_update_slice` instead of `.at[...].set(...)`
         self.memory_bank.value = jax.lax.dynamic_update_slice(
-            self.memory_bank.value, # 1. The original large array to be updated
-            keys_to_add,             # 2. The smaller array containing the new data
-            start_indices            # 3. The dynamic starting position
+            self.memory_bank.get_value(), # 1. The original large array to be updated
+            keys_to_add,                  # 2. The smaller array containing the new data
+            start_indices                 # 3. The dynamic starting position
         )
 
         # The pointer update logic remains the same, as it's just arithmetic
@@ -555,7 +649,8 @@ class HetSIREN(nnx.Module):
             ctf_type = None
 
         # Generate projections
-        images_corrected = self.phys_decoder(x, values, coords, self.xsize, rotations, shifts, ctf, ctf_type)
+        images_corrected, _ = self.phys_decoder(x, values, coords, self.xsize, rotations, shifts,
+                                                self.delta_volume_decoder.centering, ctf, ctf_type, self.sigma)
 
         if return_latent:
             return images_corrected, latents
@@ -574,21 +669,21 @@ class HetSIREN(nnx.Module):
 
         coords, values = self.delta_volume_decoder(x)
 
-        return (coords - self.delta_volume_decoder.factor * self.delta_volume_decoder.coords,
+        return (coords - self.delta_volume_decoder.scale * self.delta_volume_decoder.coords,
                 values - self.delta_volume_decoder.reference_values)
 
 
-@partial(jax.jit, static_argnames=("do_update", "l1_lambda"))
-def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4):
+@partial(jax.jit, static_argnames=("do_update", "l1_lambda", "graph_lambda"))
+def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4):
     model, optimizer = nnx.merge(graphdef, state)
-    distributions_key, rot_sample_key, key = jnr.split(key, 3)
+    distributions_key, rot_sample_key, choice_key, key = jnr.split(key, 4)
 
     # TODO: Explore sampling the posterior with M>1
     M = 1
 
     if M > 1:
         # VMAP functions
-        phys_decoder = jax.vmap(model.phys_decoder, in_axes=(None, None, None, None, 1, None, None, None), out_axes=1)
+        phys_decoder = jax.vmap(model.phys_decoder, in_axes=(None, None, None, None, 1, None, None, None, None, None, None), out_axes=1)
         wiener2DFilter_vmap = jax.vmap(wiener2DFilter, in_axes=(1, None, None), out_axes=1)
         ctfFilter_vmap = jax.vmap(ctfFilter, in_axes=(1, None, None), out_axes=1)
     else:
@@ -597,40 +692,44 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         ctfFilter_vmap = ctfFilter
 
     # sparse_finite_3D_differences_field = jax.vmap(sparse_finite_3D_differences, in_axes=(-1, None, None), out_axes=-1)
-    distance_regularizer_from_graph_batch = jax.vmap(distance_regularizer_from_graph, in_axes=(None, 0, None))
-    repulsion_from_graph_batch = jax.vmap(repulsion_from_graph, in_axes=(None, 0, None))
+    calculate_deformation_regularity_loss_batch = jax.vmap(calculate_deformation_regularity_loss, in_axes=(0, None, None, None))
+    calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None))
 
     def loss_fn(model, x):
         # Check if Tomo mode
         if model.isTomoSIREN:
             (x, subtomogram_label) = x
 
+        # Prepare input images for encoder
+        if model.ctf_type != "precorrect":
+            x_in = wiener2DFilter(x[..., 0], ctf, pad_factor=pad_factor)[..., None]
+        else:
+            x_in = x
+        x_in = apply_batch_translations(x_in, shifts)
+
         # Encode latent E(z)
         if model.isVae:
             if model.decoupling:
-                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
             elif model.isTomoSIREN:
                 (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                (_, latent_1, _), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+                (_, latent_1, _), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
             else:
-                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x, return_alignment_refinement=True)
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
         else:
             if model.decoupling:
-                latent, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+                latent, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
             elif model.isTomoSIREN:
                 latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                latent_1, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+                latent_1, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
             else:
-                latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x, return_alignment_refinement=True)
+                latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
 
         # Decode volumes
         if model.isVae:
             coords, values = model.delta_volume_decoder(sample)
         else:
             coords, values = model.delta_volume_decoder(latent)
-
-        # Compute field
-        field = coords / model.delta_volume_decoder.factor - model.delta_volume_decoder.coords
 
         # Get rotation matrices
         if euler_angles.ndim == 2:
@@ -654,33 +753,38 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         shifts_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
 
         # Only rigid part: coords and values
-        input_rigid = jnp.zeros((1, sample.shape[1]))
-        coords_reference, values_reference = model.delta_volume_decoder_rigid(input_rigid)
+        reference_values = model.delta_volume_decoder.reference_values
+        reference_coords = model.delta_volume_decoder.scale * model.delta_volume_decoder.coords
+
+        # Centering
+        centering = model.delta_volume_decoder.centering
 
         # Generate projections
         if model.has_reference_volume:
-            images_corrected = phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
-            images_corrected_field = phys_decoder(x, model.delta_volume_decoder.reference_values, coords, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+            images_corrected, _ = phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize, rotations_refined, shifts_refined,
+                                               centering, ctf, model.ctf_type, model.sigma, 0.0)
+            images_corrected_field, _ = phys_decoder(x, reference_values, coords, model.xsize, rotations_refined, shifts_refined,
+                                                     centering, ctf, model.ctf_type, model.sigma, 0.0)
         else:
-            images_corrected = phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+            images_corrected, _ = phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined,
+                                               centering, ctf, model.ctf_type, model.sigma, 0.0)
             images_corrected_field = images_corrected
-        images_rigid = phys_decoder(x, values_reference, coords_reference, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+        images_rigid, _ = phys_decoder(x, reference_values, reference_coords, model.xsize, rotations_refined, shifts_refined,
+                                       centering, ctf, model.ctf_type, model.sigma, 0.0)
 
-        # Project "mask"
-        if not model.delta_volume_decoder.transport_mass:
-            projected_mask = phys_decoder(x, jnp.ones_like(values), jax.lax.stop_gradient(coords), model.xsize,  rotations_refined, shifts_refined, ctf, None, False)
-            projected_mask = jnp.where(projected_mask > 1, 1.0, projected_mask)
-
-            projected_mask_rigid = phys_decoder(x, jnp.ones_like(values_reference), coords_reference, model.xsize, rotations_refined, shifts_refined, ctf, None, False)
-            projected_mask_rigid = jnp.where(projected_mask_rigid > 1, 1.0, projected_mask_rigid)
-
+        # Projection "mask" in case of no mass transport
+        if not model.delta_volume_decoder.transport_mass and model.local_reconstruction:
+            _, projected_mask = phys_decoder(x, jnp.ones_like(values), jax.lax.stop_gradient(coords), model.xsize,
+                                             rotations_refined, shifts_refined, centering, ctf, None, model.sigma, False, 0.0)
+            _, projected_mask_rigid = phys_decoder(x, jnp.ones_like(reference_values), reference_coords, model.xsize,
+                                                   rotations_refined, shifts_refined, centering, ctf, None, model.sigma, False, 0.0)
         else:
             projected_mask = jnp.ones_like(x)[..., 0]
             projected_mask_rigid = jnp.ones_like(x)[..., 0]
 
-            if M > 1:
-                projected_mask = projected_mask[:, None, ...]
-                projected_mask_rigid = projected_mask_rigid[:, None, ...]
+        if M > 1:
+            projected_mask = projected_mask[:, None, ...]
+            projected_mask_rigid = projected_mask_rigid[:, None, ...]
 
         # Losses
         images_corrected = jnp.squeeze(images_corrected)
@@ -690,14 +794,14 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
         # Consider CTF if Wiener mode (only for loss)
         if model.ctf_type == "wiener":
-            x_loss = wiener2DFilter(x, ctf, pad_factor=2)
-            images_corrected_loss = wiener2DFilter_vmap(images_corrected, ctf, 2)
-            images_corrected_field_loss = wiener2DFilter_vmap(images_corrected_field, ctf, 2)
+            x_loss = wiener2DFilter(x, ctf, pad_factor=pad_factor)
+            images_corrected_loss = wiener2DFilter_vmap(images_corrected, ctf, pad_factor)
+            images_corrected_field_loss = wiener2DFilter_vmap(images_corrected_field, ctf, pad_factor)
             images_rigid_loss = wiener2DFilter_vmap(images_rigid, ctf, 2)
         elif model.ctf_type == "squared":
-            x_loss = ctfFilter(x, ctf, pad_factor=2)
-            images_corrected_loss = ctfFilter_vmap(images_corrected, ctf, 2)
-            images_corrected_field_loss = ctfFilter_vmap(images_corrected_field, ctf, 2)
+            x_loss = ctfFilter(x, ctf, pad_factor=pad_factor)
+            images_corrected_loss = ctfFilter_vmap(images_corrected, ctf, pad_factor)
+            images_corrected_field_loss = ctfFilter_vmap(images_corrected_field, ctf, pad_factor)
             images_rigid_loss = ctfFilter_vmap(images_rigid, ctf, 2)
         else:
             x_loss = x
@@ -715,9 +819,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         images_rigid_loss = images_rigid_loss * projected_mask_rigid
 
         # recon_loss = dm_pix.mae(images_corrected_loss[..., None], x_loss[..., None]).mean()
-        recon_loss = 0.5 * (mse(images_corrected_loss[..., None], x_loss[..., None]) + mse(images_corrected_field_loss[..., None], x_loss[..., None]))
+        recon_loss = 0.1 * mse(images_corrected_loss[..., None], x_loss[..., None]) + 0.9 * mse(images_corrected_field_loss[..., None], x_loss[..., None])
         recon_loss_rigid = mse(images_rigid_loss[..., None], x_loss[..., None])
-        recons_loss_all = 0.5 * (recon_loss + recon_loss_rigid)
+        recons_loss_all = 0.5 * (recon_loss.mean() + recon_loss_rigid.mean())
+        # recons_loss_all = recon_loss.mean()
 
         # L1 based denoising
         l1_loss = jnp.mean(jnp.abs(values))
@@ -771,10 +876,20 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
         # Graph based loss
         if model.has_reference_volume and model.delta_volume_decoder.transport_mass:
-            loss_graph = distance_regularizer_from_graph_batch(model.delta_volume_decoder.coords[0],  coords / model.delta_volume_decoder.factor,
-                                                               model.delta_volume_decoder.edge_index).mean()
-            loss_graph += repulsion_from_graph_batch(model.delta_volume_decoder.coords[0],  coords / model.delta_volume_decoder.factor,
-                                                     model.delta_volume_decoder.edge_index).mean()
+            # Get data
+            consensus_distances = model.delta_volume_decoder.consensus_distances
+            deformed_positions = coords / model.delta_volume_decoder.scale
+            radius_graph = model.delta_volume_decoder.edge_index
+            edge_weights = model.delta_volume_decoder.edge_weights
+            tau = model.delta_volume_decoder.tau
+
+            # Losses
+            loss_def_regularity = calculate_deformation_regularity_loss_batch(deformed_positions, radius_graph,
+                                                                              consensus_distances, edge_weights)
+            loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, tau)
+
+            # Total loss
+            loss_graph = (loss_def_regularity + 0.01 * loss_repulsion).mean()
         else:
             loss_graph = 0.0
 
@@ -787,14 +902,16 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                     rotations_random_refined = jnp.matmul(rotations_random_matrix, rotations_rigid)
                 else:
                     rotations_random_refined = jnp.matmul(rotations_random_matrix, rotations_rigid)
-                shifts_random_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations_random_matrix, "b m n -> b n m"))[:, 0, :2]
-                images_random = model.phys_decoder(x, values, coords, model.xsize, rotations_random_refined, shifts_random_refined, ctf_random, model.ctf_type)
+                # shifts_random_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations_random_matrix, "b m n -> b n m"))[:, 0, :2]
+                shifts_random_refined = jnp.zeros_like(shifts_refined)
+                images_random, _ = model.phys_decoder(x, values, coords, model.xsize, rotations_random_refined, shifts_random_refined,
+                                                      centering, ctf_random, None, model.sigma, 0.0)
                 if model.isVae:
-                    (_, latent_1, _), prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec", return_last=True, return_alignment_refinement=False)
-                    (_, latent_2, _) = model.encoder(images_random[..., None], "encoder_dec", return_alignment_refinement=False)
+                    (_, latent_1, _), prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec", return_last=True, return_alignment_refinement=False, rngs=distributions_key)
+                    (_, latent_2, _) = model.encoder(images_random[..., None], "encoder_dec", return_alignment_refinement=False, rngs=distributions_key)
                 else:
-                    latent_1, prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec", return_last=True, return_alignment_refinement=False)
-                    latent_2 = model.encoder(images_random[..., None], "encoder_dec", return_alignment_refinement=False)
+                    latent_1, prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec", return_last=True, return_alignment_refinement=False, rngs=distributions_key)
+                    latent_2 = model.encoder(images_random[..., None], "encoder_dec", return_alignment_refinement=False, rngs=distributions_key)
                 decoupling_loss = (jnp.mean(jnp.square(latent - latent_1), axis=-1).mean() +
                                    jnp.mean(jnp.square(latent - latent_2), axis=-1).mean() +
                                    jnp.mean(jnp.square(prev_layer_out - prev_layer_out_random), axis=-1).mean())
@@ -802,8 +919,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                 decoupling_loss = (jnp.mean(jnp.square(latent - latent_1), axis=-1).mean() +
                                    jnp.mean(jnp.square(prev_layer_out - prev_layer_out_random), axis=-1).mean())
 
-            random_indices = jnr.choice(model.choice_key, a=jnp.arange(model.bank_size), shape=(model.subset_size,),
-                                        replace=False)
+            random_indices = jnr.choice(choice_key, a=jnp.arange(model.bank_size), shape=(model.subset_size,), replace=False)
             memory_bank_subset = model.memory_bank[random_indices]
 
             dist = jnp.pow(latent[:, None, :] - memory_bank_subset, 2.).sum(axis=-1)
@@ -815,8 +931,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         else:
             decoupling_loss = 0.0
 
-        loss = (nll + 0.0001 * kl_loss + 0.001 * kl_pose + 0.001 * decoupling_loss
-                + l1_lambda * l1_loss + loss_graph + 100. * hist_loss)
+        loss = (nll + 0.000001 * kl_loss + 0.000001 * kl_pose + 0.000001 * decoupling_loss
+                + l1_lambda * l1_loss + graph_lambda * loss_graph + 100. * hist_loss)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
@@ -830,6 +946,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
     shifts = md["shifts"][labels]
 
     # Precompute batch CTFs
+    pad_factor = model.phys_decoder.pad_factor
     if model.ctf_type is not None:
         defocusU = md["ctfDefocusU"][labels]
         defocusV = md["ctfDefocusV"][labels]
@@ -837,10 +954,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         cs = md["ctfSphericalAberration"][labels]
         kv = md["ctfVoltage"][labels][0]
         ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
-                         model.sr, [2 * model.xsize, int(2 * 0.5 * model.xsize + 1)],
+                         model.sr, [pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
                          x.shape[0], True)
     else:
-        ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
+        ctf = jnp.ones([x.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     if model.ctf_type == "precorrect":
         # Wiener filter
@@ -853,10 +970,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         defocusV = jnr.choice(distributions_key, defocusV, axis=0, shape=(x.shape[0],), replace=False)
         defocusAngle = jnr.choice(distributions_key, defocusAngle, axis=0, shape=(x.shape[0],), replace=False)
         ctf_random = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
-                                model.sr, [2 * model.xsize, int(2 * 0.5 * model.xsize + 1)],
+                                model.sr, [pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
                                 x.shape[0], True)
     else:
-        ctf_random = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
+        ctf_random = jnp.ones([x.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
     if model.isTomoSIREN:
@@ -865,7 +982,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         (loss, (recon_loss, latent)), grads = grad_fn(model, x)
 
     if do_update:
-        optimizer.update(grads)
+        optimizer.update(model, grads)
 
         # Update memory bank
         model.enqueue(latent)
@@ -878,29 +995,221 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
 
 @jax.jit
+def gradient_for_recon_graph_losses(graphdef, state, x, labels, md, key):
+    model, optimizer = nnx.merge(graphdef, state)
+
+    distributions_key, key = jax.random.split(key, 2)
+
+    phys_decoder = model.phys_decoder
+    wiener2DFilter_vmap = wiener2DFilter
+    ctfFilter_vmap = ctfFilter
+
+    calculate_deformation_regularity_loss_batch = jax.vmap(calculate_deformation_regularity_loss, in_axes=(0, None, None, None))
+    calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None))
+
+    def predict_latent_from_images(model, x):
+        # Check if Tomo mode
+        if model.isTomoSIREN:
+            (x, subtomogram_label) = x
+
+        # Prepare input images for encoder
+        if model.ctf_type != "precorrect":
+            x_in = wiener2DFilter(x[..., 0], ctf, pad_factor=pad_factor)[..., None]
+        else:
+            x_in = x
+        x_in = apply_batch_translations(x_in, shifts)
+
+        # Encode latent E(z)
+        if model.isVae:
+            if model.decoupling:
+                (latent, _, _), (rotations_rigid, shifts_rigid, _), _ = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
+            elif model.isTomoSIREN:
+                (latent, _, _), _ = model.encoder(subtomogram_label, "encoder_dec", return_last=True, rngs=distributions_key)
+                _, (rotations_rigid, shifts_rigid, _), _ = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
+            else:
+                (latent, _, _), (rotations_rigid, shifts_rigid, _) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
+        else:
+            if model.decoupling:
+                latent, (rotations_rigid, shifts_rigid, _), _ = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
+            elif model.isTomoSIREN:
+                latent, _ = model.encoder(subtomogram_label, "encoder_dec", return_last=True, rngs=distributions_key)
+                _, (rotations_rigid, shifts_rigid, _), _ = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
+            else:
+                latent, (rotations_rigid, shifts_rigid, _) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
+
+        return latent, rotations_rigid, shifts_rigid
+
+
+    def loss_representation_fn(model, x, latent, rotations_rigid, shifts_rigid):
+        # Decode volumes
+        coords, values = model.delta_volume_decoder(latent)
+
+        # Get rotation matrices
+        if euler_angles.ndim == 2:
+            rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
+        else:
+            rotations = euler_angles
+
+        rotations_refined = jnp.matmul(rotations, rotations_rigid)
+        shifts_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
+
+        # Reference values
+        reference_values = model.delta_volume_decoder.reference_values
+
+        # Centering
+        centering = model.delta_volume_decoder.centering
+
+        # Generate projections
+        if model.has_reference_volume:
+            images_corrected_field, _ = phys_decoder(x, reference_values, coords, model.xsize, rotations_refined,
+                                                     shifts_refined, centering, ctf, model.ctf_type, model.sigma, 0.0)
+        else:
+            images_corrected_field, _ = phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined,
+                                                     centering, ctf, model.ctf_type, model.sigma, 0.0)
+
+        # Projection "mask" in case of no mass transport
+        if not model.delta_volume_decoder.transport_mass and model.local_reconstruction:
+            _, projected_mask = phys_decoder(x, jnp.ones_like(values), jax.lax.stop_gradient(coords), model.xsize,
+                                             rotations_refined, shifts_refined, centering, ctf, None, model.sigma, False, 0.0)
+        else:
+            projected_mask = jnp.ones_like(x)[..., 0]
+
+        # Losses
+        images_corrected_field = jnp.squeeze(images_corrected_field)
+        x = jnp.squeeze(x)
+
+        # Consider CTF if Wiener mode (only for loss)
+        if model.ctf_type == "wiener":
+            x_loss = wiener2DFilter(x, ctf, pad_factor=pad_factor)
+            images_corrected_field_loss = wiener2DFilter_vmap(images_corrected_field, ctf, pad_factor)
+        elif model.ctf_type == "squared":
+            x_loss = ctfFilter(x, ctf, pad_factor=pad_factor)
+            images_corrected_field_loss = ctfFilter_vmap(images_corrected_field, ctf, pad_factor)
+        else:
+            x_loss = x
+            images_corrected_field_loss = images_corrected_field
+
+        # Projection mask
+        x_loss = x_loss * projected_mask
+        images_corrected_field_loss = images_corrected_field_loss * projected_mask
+
+        recon_loss = 0.9 * mse(images_corrected_field_loss[..., None], x_loss[..., None])
+
+        return recon_loss.mean()
+
+    def loss_graph_fn(model, latent):
+        # Decode volumes
+        coords, values = model.delta_volume_decoder(latent)
+
+        # Graph based loss
+        if model.has_reference_volume and model.delta_volume_decoder.transport_mass:
+            # Get data
+            consensus_distances = model.delta_volume_decoder.consensus_distances
+            deformed_positions = coords / model.delta_volume_decoder.scale
+            radius_graph = model.delta_volume_decoder.edge_index
+            edge_weights = model.delta_volume_decoder.edge_weights
+            tau = model.delta_volume_decoder.tau
+
+            # Losses
+            loss_def_regularity = calculate_deformation_regularity_loss_batch(deformed_positions, radius_graph,
+                                                                              consensus_distances, edge_weights)
+            loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, tau)
+
+            # Total loss
+            loss_graph = (loss_def_regularity + 0.01 * loss_repulsion).mean()
+        else:
+            loss_graph = 0.0
+
+        return loss_graph
+
+    # Check if Tomo mode
+    if model.isTomoSIREN:
+        (x, subtomogram_label) = x
+
+    # Precompute batch aligments
+    euler_angles = md["euler_angles"][labels]
+
+    # Precompute batch shifts
+    shifts = md["shifts"][labels]
+
+    # Precompute batch CTFs
+    pad_factor = model.phys_decoder.pad_factor
+    if model.ctf_type is not None:
+        defocusU = md["ctfDefocusU"][labels]
+        defocusV = md["ctfDefocusV"][labels]
+        defocusAngle = md["ctfDefocusAngle"][labels]
+        cs = md["ctfSphericalAberration"][labels]
+        kv = md["ctfVoltage"][labels][0]
+        ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                         model.sr, [pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
+                         x.shape[0], True)
+    else:
+        ctf = jnp.ones([x.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
+
+    if model.ctf_type == "precorrect":
+        # Wiener filter
+        x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+
+    # Get latent vectors and alignments
+    latent, rotations_rigid, shifts_rigid = predict_latent_from_images(model, x)
+    latent = jax.lax.stop_gradient(latent)
+    rotations_rigid = jax.lax.stop_gradient(rotations_rigid)
+    shifts_rigid = jax.lax.stop_gradient(shifts_rigid)
+    x = jax.lax.stop_gradient(x)
+
+    grads_data = nnx.grad(loss_representation_fn)(model, x, latent, rotations_rigid, shifts_rigid)
+    grads_reg = nnx.grad(loss_graph_fn)(model, latent)
+
+    params_filter = nnx.All(nnx.Param, nnx.PathContains('hidden_coords'))
+    grads_data, _ = grads_data.split(params_filter, ...)
+    grads_reg, _ = grads_reg.split(params_filter, ...)
+
+    # Calculate Global Norms
+    def global_norm(g):
+        leaves = jax.tree_util.tree_leaves(g)
+        return jnp.sqrt(sum(jnp.sum(jnp.square(l)) for l in leaves))
+
+    # norm_data = optax.global_norm(grads_data)
+    # norm_reg = optax.global_norm(grads_reg)
+    norm_data = global_norm(grads_data)
+    norm_reg = global_norm(grads_reg)
+
+    return norm_data, norm_reg
+
+
+@jax.jit
 def validation_step_hetsiren(graphdef, state, x, labels, md, key):
     model, optimizer = nnx.merge(graphdef, state)
+
+    distributions_key, key = jax.random.split(key, 2)
 
     def loss_fn(model, x):
         # Check if Tomo mode
         if model.isTomoSIREN:
             (x, subtomogram_label) = x
 
+        # Prepare input images for encoder
+        if model.ctf_type != "precorrect":
+            x_in = wiener2DFilter(x[..., 0], ctf, pad_factor=pad_factor)[..., None]
+        else:
+            x_in = x
+        x_in = apply_batch_translations(x_in, shifts)
+
         # Encode latent E(z)
         if model.isVae:
             if model.decoupling:
-                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
             elif model.isTomoSIREN:
-                (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+                (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True, rngs=distributions_key)
             else:
-                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x, return_alignment_refinement=True)
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
         else:
             if model.decoupling:
-                latent, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True)
+                latent, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
             elif model.isTomoSIREN:
-                latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+                latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True, rngs=distributions_key)
             else:
-                latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x, return_alignment_refinement=True)
+                latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
 
         # Decode volumes
         if model.isVae:
@@ -918,37 +1227,56 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
         rotations_refined = jnp.matmul(rotations, rotations_rigid)
         shifts_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
 
-        # Generate projections
-        images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+        # Centering
+        centering = model.delta_volume_decoder.centering
 
-        # Project "mask"
-        if not model.delta_volume_decoder.transport_mass:
-            projected_mask = model.phys_decoder(x, jnp.ones_like(values), coords, model.xsize,  rotations_refined, shifts_refined, ctf, None, False)
+        # Generate projections
+        if model.has_reference_volume:
+            reference_values = model.delta_volume_decoder.reference_values
+            images_corrected, _ = model.phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize, rotations_refined,
+                                                     shifts_refined, centering, ctf, model.ctf_type, model.sigma, 0.0)
+            images_corrected_field, _ = model.phys_decoder(x, reference_values, coords, model.xsize, rotations_refined,
+                                                           shifts_refined, centering, ctf, model.ctf_type, model.sigma, 0.0)
+        else:
+            images_corrected, _ = model.phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined,
+                                                     centering, ctf, model.ctf_type, model.sigma, 0.0)
+            images_corrected_field = images_corrected
+
+        # Projection "mask" in case of no mass transport
+        if not model.delta_volume_decoder.transport_mass and model.local_reconstruction:
+            _, projected_mask = model.phys_decoder(x, jnp.ones_like(values), jax.lax.stop_gradient(coords), model.xsize,
+                                                   rotations_refined, shifts_refined, centering, ctf, None, model.sigma,
+                                                   False, 0.0)
         else:
             projected_mask = jnp.ones_like(x)[..., 0]
 
         # Losses
         images_corrected = jnp.squeeze(images_corrected)
+        images_corrected_field = jnp.squeeze(images_corrected_field)
         x = jnp.squeeze(x)
 
         # Consider CTF if Wiener mode (only for loss)
         if model.ctf_type == "wiener":
-            x_loss = wiener2DFilter(x, ctf, pad_factor=2)
-            images_corrected_loss = wiener2DFilter(images_corrected, ctf, 2)
+            x_loss = wiener2DFilter(x, ctf, pad_factor=pad_factor)
+            images_corrected_loss = wiener2DFilter(images_corrected, ctf, pad_factor)
+            images_corrected_field_loss = wiener2DFilter(images_corrected_field, ctf, pad_factor)
         elif model.ctf_type == "squared":
-            x_loss = ctfFilter(x, ctf, pad_factor=2)
-            images_corrected_loss = ctfFilter(images_corrected, ctf, 2)
+            x_loss = ctfFilter(x, ctf, pad_factor=pad_factor)
+            images_corrected_loss = ctfFilter(images_corrected, ctf, pad_factor)
+            images_corrected_field_loss = ctfFilter(images_corrected_field, ctf, pad_factor)
         else:
             x_loss = x
             images_corrected_loss = images_corrected
+            images_corrected_field_loss = images_corrected_field
 
         # Projection mask
         x_loss = x_loss * projected_mask
         images_corrected_loss = images_corrected_loss * projected_mask
+        images_corrected_field_loss = images_corrected_field_loss * projected_mask
 
-        recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
+        recon_loss = 0.1 * mse(images_corrected_loss[..., None], x_loss[..., None]) + 0.9 * mse( images_corrected_field_loss[..., None], x_loss[..., None])
 
-        return recon_loss
+        return recon_loss.mean()
 
     # Check if Tomo mode
     if model.isTomoSIREN:
@@ -961,6 +1289,7 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
     shifts = md["shifts"][labels]
 
     # Precompute batch CTFs
+    pad_factor = model.phys_decoder.pad_factor
     if model.ctf_type is not None:
         defocusU = md["ctfDefocusU"][labels]
         defocusV = md["ctfDefocusV"][labels]
@@ -968,10 +1297,10 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
         cs = md["ctfSphericalAberration"][labels]
         kv = md["ctfVoltage"][labels][0]
         ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
-                         model.sr, [2 * model.xsize, int(2 * 0.5 * model.xsize + 1)],
+                         model.sr, [pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
                          x.shape[0], True)
     else:
-        ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
+        ctf = jnp.ones([x.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     if model.ctf_type == "precorrect":
         # Wiener filter
@@ -997,13 +1326,13 @@ def main():
     import shutil
     from xmipp_metadata.image_handler import ImageHandler
     import optax
-    import torch
+    from contextlib import closing
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns, NumpyGenerator
     from hax.networks import train_step_hetsiren
     from hax.metrics import JaxSummaryWriter
-    from hax.networks import VolumeAdjustment, train_step_volume_adjustment
-    from hax.schedulers import CosineAnnealingScheduler
+    from hax.programs import fit_volume, adjust_weights_to_images
+    # from hax.schedulers import CosineAnnealingScheduler
 
     def list_of_floats(arg):
         return list(map(float, arg.split(',')))
@@ -1035,6 +1364,12 @@ def main():
                              f'{bcolors.WARNING}NOTE{bcolors.ENDC}: When this option is set and a reference volume is provided, we recommend changing the reference mask to a tight mask computed '
                              f'from the reference volume. This mask now tells the program which regions should be moved. Therefore, consider providing a mask that covers all the protein regions you would like '
                              f'to be analyzed by HetSIREN.')
+    parser.add_argument("--num_gaussians", required=False, type=int,
+                        help="Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. "
+                            "The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume "
+                            "with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., "
+                            "the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians "
+                            "so that the reproduce the reference volume as well as possible.")
     parser.add_argument("--local_reconstruction", action='store_true',
                         help=f'When set, HetSIREN will turn to local heterogeneous reconstruction/refinement mod, focusing the analysis of heterogeneity to a region of interest enclosed by the provided refernece mask. '
                              f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, TRANSPORT MASS WILL BE OVERRIDDEN AND NOT CONSIDERED. '
@@ -1067,11 +1402,17 @@ def main():
     parser.add_argument("--reload", required=False, type=str,
                         help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - "
                              f"{bcolors.WARNING}NOTE{bcolors.ENDC}: If a reference volume was provided, HetSIREN also learns a gray level adjustment. In this case, "
-                             f"reload must be the path to a folder containing two additional folders called: {bcolors.UNDERLINE}HetSIREN{bcolors.ENDC} and {bcolors.UNDERLINE}volumeAdjustment{bcolors.ENDC})")
+                             f"reload must be the path to a folder containing two additional folders called: {bcolors.UNDERLINE}HetSIREN{bcolors.ENDC} and {bcolors.UNDERLINE}Gaussian_volume_fitting{bcolors.ENDC})")
     parser.add_argument("--denoising_strength", required=False, type=float, default=1e-4,
                         help=f"Determines how strongly HetSIREN will learn to remove noise from the resulting volumes. Increasing the value of this parameter will result in a stronger regularization of the noise, but it may affect the protein "
                              f"signal as well. ({bcolors.WARNING}NOTE{bcolors.ENDC}: We recommend setting this parameter in the range 0.0001 to 0.1)")
-    args = parser.parse_args()
+    parser.add_argument("--implicit_network", action='store_true',
+                        help=f'When set, HetSIREN will use an implicit neural network approach to recover conformational states. Implicit neural networks are more memory consuming, but they are also more accurate in the detection of very local motions. '
+                             f'If this architecture is selected, we strongly recommend to set as well the parameter {bcolors.ITALIC}total_mass{bcolors.ENDC} to limit the memory consumption of the network and increase its performance.')
+    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
+                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
+                             f"the default disk.")
+    args, _ = parser.parse_known_args()
 
     # Manually handed parameters
     local_reconstruction = args.local_reconstruction
@@ -1106,67 +1447,37 @@ def main():
             volume_size = generator.md.getMetaDataImage(0).shape[0]
             mask = ImageHandler().createCircularMask(boxSize=volume_size, is3D=True)
 
-    # Data loading approach
-    if args.load_images_to_ram:
-        mmap = False
-        mmap_output_dir = None
-    else:
-        mmap = True
-        mmap_output_dir = args.output_path
-
     # If exists, clean MMAP
-    if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
-        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
+    # if os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
+    #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))
 
     # Random keys
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     rng, model_key, choice_key = jax.random.split(rng, 3)
 
-    # Prepare network (HetSIREN)
-    hetsiren = HetSIREN(args.lat_dim, vol, mask, generator.md.getMetaDataImage(0).shape[0], args.sr,
-                        ctf_type=args.ctf_type, decoupling=True, isVae=True, transport_mass=transport_mass,
-                        local_reconstruction=local_reconstruction, bank_size=len(generator.md), isTomoSIREN=isTomoSIREN,
-                        rngs=nnx.Rngs(model_key, choice=choice_key))
-
     # Reload network
     if args.reload is not None:
-        hetsiren = NeuralNetworkCheckpointer.load(hetsiren, os.path.join(args.reload, "HetSIREN"))
+        hetsiren = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "HetSIREN"))
 
-    # Volume adjustment (only if reference volume is provided)
-    if args.vol is not None:
-        # Extract mask coords
-        inds = np.asarray(np.where(mask > 0.0)).T
-        values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
-        factor = 0.5 * vol.shape[0]
-        coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)
-        coords = (coords - factor) / factor
-
-        # Define volume adjustment network
-        volumeAdjustment = VolumeAdjustment(lat_dim=3, coords=coords, values=values, predicts_value=True, rngs=nnx.Rngs(model_key))
-
-        # Reload volume adjustment network if needed
-        if args.reload is not None:
-            volumeAdjustment = NeuralNetworkCheckpointer.load(volumeAdjustment, os.path.join(args.reload, "volumeAdjustment"))
+    # Prepare grain dataset
+    if not args.load_images_to_ram and args.mode in ["train", "predict"]:
+        mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
+        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4, precision=np.float16, group_size=1, shard_size=10000)
 
     # Train network
     if args.mode == "train":
 
-        hetsiren.train()
-
         # Prepare summary writer
         writer = JaxSummaryWriter(os.path.join(args.output_path, "HetSIREN_metrics"))
 
-        # Prepare data loader
-        data_loader_full, data_loader, data_loader_validation  = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
-                                                                                             mmap=mmap, mmap_output_dir=mmap_output_dir, split_fraction=args.dataset_split_fraction)
-
-        # Example of training data for Tensorboard
-        if hetsiren.isTomoSIREN:
-            (x_example, _), labels_example = next(iter(data_loader))
-        else:
-            x_example, labels_example = next(iter(data_loader))
-        x_example = jax.vmap(min_max_scale)(x_example)
-        writer.add_images("Training data batch", x_example, dataformats="NHWC")
+        # data_loader_train, data_loader_val = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global", num_epochs=None,
+        #                                                                     num_workers=-1, num_threads=1, split_fraction=args.dataset_split_fraction,
+        #                                                                     load_to_ram=args.load_images_to_ram)
+        # steps_per_epoch = int(int(args.dataset_split_fraction[0] * len(generator.md)) / args.batch_size)
+        # steps_per_val = int(int(args.dataset_split_fraction[1] * len(generator.md)) / args.batch_size)
+        data_loader_train = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global", num_epochs=None,
+                                                            num_workers=-1, num_threads=1, load_to_ram=args.load_images_to_ram)
+        steps_per_epoch = int(len(generator.md) / args.batch_size)
 
         # Projector help text in Tensorboard
         legend_projector = """
@@ -1180,71 +1491,66 @@ def main():
                 """
         writer.add_text("Projector warning", legend_projector)
 
-        if args.vol is not None:
-            if not os.path.isdir(os.path.join(args.output_path, "HetSIREN_CHECKPOINT")):
-                # Optimizers (Volume Adjustment)
-                optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
-                graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
+        if not "hetsiren" in locals():
+            if args.vol is not None:
+                fit_path = os.path.join(args.output_path, "Gaussian_volume_fitting")
+                if not os.path.isdir(os.path.join(fit_path)):
+                    # Consensus volume
+                    if args.num_gaussians is not None:
+                        model, _, _ = fit_volume(vol, mask=mask, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
+                    else:
+                        model, _, _ = fit_volume(vol, mask=mask, iterations=20000, learning_rate=0.01, grad_threshold=1e-5, densify_interval=2000, n_init=2500)
 
-                # Number epochs (volume adjustment)
-                if len(generator.md) >= 10000:
-                    num_epochs_vol = 20
+                    # Adjust to images
+                    model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
+                                                        num_epochs=3, is_global=True)
+
+                    # Save model
+                    NeuralNetworkCheckpointer.save(model, fit_path)
+
+                    # Save volume
+                    vol = np.array(model(place_deltas=True))
+                    vol_splatted = np.array(model())
+                    ImageHandler().write(vol_splatted, os.path.join(args.output_path, "consensus_volume.mrc"), overwrite=True)
+                    ImageHandler().write(vol, os.path.join(args.output_path, "consensus_volume_deltas.mrc"), overwrite=True)
                 else:
-                    num_epochs_vol = 200
+                    model = NeuralNetworkCheckpointer.load(checkpoint_path=fit_path)
+                    vol = np.array(model(place_deltas=True))
 
-                # Training loop (Volume Adjustment)
-                print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
-                for i in range(num_epochs_vol):
-                    total_loss = 0
+            # Prepare network (HetSIREN)
+            factor = 0.5 * generator.md.getMetaDataImage(0).shape[0]
+            coords = np.array(factor * model.means.get_value() + factor)
+            coords = np.stack([coords[..., 2], coords[..., 1], coords[..., 0]], axis=1)
+            values = np.array(jax.nn.relu(model.weights.get_value()))
+            sigma = jax.nn.relu(model.sigma_param.get_value())
+            hetsiren = HetSIREN(args.lat_dim, vol, mask, coords, values,
+                                generator.md.getMetaDataImage(0).shape[0], args.sr, sigma=sigma,
+                                ctf_type=args.ctf_type, decoupling=True, isVae=True, transport_mass=transport_mass,
+                                local_reconstruction=local_reconstruction, bank_size=len(generator.md),  # 1024
+                                isTomoSIREN=isTomoSIREN, is_implicit=args.implicit_network,
+                                rngs=nnx.Rngs(model_key))
+        hetsiren.train()
 
-                    # For progress bar (TQDM)
-                    step = 1
-                    print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
-                    pbar = tqdm(data_loader_full, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
-                                colour="green")
-
-                    for (x, labels) in pbar:
-                        if isinstance(x, tuple):
-                            x = x[0]
-
-                        loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
-                                                                   args.ctf_type, vol.shape[0])
-                        total_loss += loss
-
-                        # Progress bar update  (TQDM)
-                        pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
-
-                        # Summary writer (training loss)
-                        if step % int(np.ceil(0.1 * len(data_loader_full))) == 0:
-                            writer.add_scalar('Training loss (volume adjustment)',
-                                              total_loss / step,
-                                              i * len(data_loader_full) + step)
-
-                        step += 1
-
-                volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
-                values = volumeAdjustment()
-
-                # Place values on grid and replace HetSIREN reference volume
-                grid = jnp.zeros_like(vol)
-                grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
-                hetsiren.reference_volume = grid
-                hetsiren.delta_volume_decoder.reference_values = values
-
-                # Save model
-                NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
+        # Example of training data for Tensorboard
+        with closing(iter(data_loader_train)) as iter_data_loader:
+            if hetsiren.isTomoSIREN:
+                (x_example, _), labels_example = next(iter_data_loader)
+            else:
+                x_example, labels_example = next(iter_data_loader)
+        x_example = jax.vmap(min_max_scale)(x_example)
+        writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
         # Learning rate scheduler
         # total_steps = args.epochs * len(data_loader)
         # lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=args.learning_rate, total_steps=total_steps, warmup_frac=0.1, end_value=0.0, init_value=1e-5)
 
         # Optimizers (HetSIREN)
-        optimizer = nnx.Optimizer(hetsiren, optax.adamw(1e-4))
+        optimizer = nnx.Optimizer(hetsiren, optax.adamw(args.learning_rate), wrt=nnx.Param)
         graphdef, state = nnx.split((hetsiren, optimizer))
 
         # Resume if checkpoint exists
         if os.path.isdir(os.path.join(args.output_path, "HetSIREN_CHECKPOINT")):
-            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"))
+            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"), optimizer)
             print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
         else:
             resume_epoch = 0
@@ -1265,94 +1571,133 @@ def main():
 
         # Training loop (HetSIREN)
         print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
-        for i in range(resume_epoch, args.epochs):
-            total_loss = 0
-            total_recon_loss = 0
-            total_validation_loss = 0
 
-            # For progress bar (TQDM)
-            step = 1
-            step_validation = 1
-            print(f'\nTraining epoch {i + 1}/{args.epochs} |')
-            pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
+        i = 0
+        pbar = tqdm(range(resume_epoch * steps_per_epoch, args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=", colour="green",
+                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
-            for (x, labels) in pbar:
-                loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng, l1_lambda=args.denoising_strength)
+        # with closing(iter(data_loader_train)) as iter_data_loader_train, closing(iter(data_loader_val)) as iter_data_loader_val:
+        with closing(iter(data_loader_train)) as iter_data_loader_train:
+
+            for total_steps in pbar:
+                (x, labels) = next(iter_data_loader_train)
+
+                if total_steps % steps_per_epoch == 0:
+                    total_loss = 0
+                    total_recon_loss = 0
+                    total_validation_loss = 0
+
+                    # Compute graph lambda
+                    graph_lambda = 0.9
+                    # if i < num_warmup_epochs:
+                    #     graph_lambda = 1.0
+                    # else:
+                    #     pbar.set_description(f"{bcolors.WARNING}Computing graph loss lambda{bcolors.ENDC}")
+                    #     grad_norm_data, grad_norm_reg = 0.0, 0.0
+                    #     for _ in range(int(0.1 * steps_per_epoch)):
+                    #         (x_graph, labels_graph) = next(iter_data_loader)
+                    #         grad_norm_data_step, grad_norm_reg_step = gradient_for_recon_graph_losses(graphdef, state, x_graph, labels_graph, md, rng)
+                    #         grad_norm_data += np.array(grad_norm_data_step)
+                    #         grad_norm_reg += np.array(grad_norm_reg_step)
+                    #         pbar.set_postfix_str(f"graph_lambda={0.9 * (grad_norm_data / grad_norm_reg):.5f}")
+                    #     graph_lambda = 0.9 * (grad_norm_data / grad_norm_reg)
+
+                    # For progress bar (TQDM)
+                    step = 1
+                    step_validation = 1
+                    pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
+
+                    # Log intermediate results at the begining of the epoch
+                    # Get first 5 images from batch
+                    if hetsiren.isTomoSIREN:
+                        x_for_tb = x[0][:5]
+                    else:
+                        x_for_tb = x[:5]
+                    labels_for_tb = labels[:5]
+
+                    # Decode some images and show them in Tensorboard
+                    x_pred_intermediate, latents_intermediate = hetsiren_decode_image(graphdef, state, x_for_tb,
+                                                                                      labels_for_tb, md_columns,
+                                                                                      ctf_type=args.ctf_type,
+                                                                                      return_latent=True,
+                                                                                      corrupt_projection_with_ctf=True)
+                    x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
+                    writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
+
+                    # Decode some states and show them in Tensorboard
+                    volumes_intermediate = hetsiren_decode_volume(graphdef, state, latents_intermediate)
+                    writer.add_volumes_slices(volumes_intermediate)
+
+                    # Log landscape stored in memory bank
+                    if i > 0 and i % 5 == 0:
+                        choice_key_use, choice_key = jax.random.split(rng, 2)
+                        hetsiren_intermediate, _ = nnx.merge(graphdef, state)
+                        random_indices = jnr.choice(choice_key_use,
+                                                    a=jnp.arange(hetsiren_intermediate.bank_size),
+                                                    shape=(hetsiren_intermediate.subset_size,), replace=False)
+                        latents_intermediate = hetsiren_intermediate.memory_bank.get_value()[random_indices]
+                        latents_data_loader = NumpyGenerator(latents_intermediate).return_grain_dataset(
+                            preShuffle=False, shuffle=False, batch_size=args.batch_size,
+                            num_epochs=1, num_workers=0)
+                        latents_images = []
+                        for (latents, _) in latents_data_loader:
+                            random_labels = jnp.asarray(
+                                np.random.randint(low=0, high=len(generator.md), size=(latents.shape[0],)),
+                                dtype=jnp.int32)
+                            x_pred_intermediate = hetsiren_decode_image(graphdef, state, latents, random_labels,
+                                                                        md_columns, ctf_type=None, return_latent=False,
+                                                                        corrupt_projection_with_ctf=False)
+                            x_pred_intermediate = \
+                            image_resize(x_pred_intermediate[..., None], (latents.shape[0], 128, 128, 1),
+                                         method="bilinear")[..., 0]
+                            latents_images.append(np.asarray(x_pred_intermediate))
+                        latents_images = np.concatenate(latents_images, axis=0)
+                        latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)
+                        latent_images_max = latents_images.max(axis=(1, 2), keepdims=True)
+                        latents_images = (latents_images - latent_images_min) / (latent_images_max - latent_images_min)
+                        writer.add_embedding(latents_intermediate, label_img=latents_images[:, None, ...],
+                                             tag="HetSIREN latent space", global_step=i)
+
+                        # Save checkpoint model
+                        NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path,
+                                                                                                  "HetSIREN_CHECKPOINT"),
+                                                                    epoch=i)
+
+                    i += 1
+
+                loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng,
+                                                                   l1_lambda=args.denoising_strength,
+                                                                   graph_lambda=graph_lambda)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
-
                 # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
+                if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
                     writer.add_scalar('Training loss (HetSIREN)',
                                       total_loss / step,
-                                      i * len(data_loader) + step)
+                                      i * steps_per_epoch + step)
 
                     writer.add_scalars('Reconstruction loss (HetSIREN)',
                                        {"train": total_recon_loss / step},
-                                        i * len(data_loader) + step)
+                                        i * steps_per_epoch + step)
 
-                # Summary writer (validation loss)
-                if step % int(np.ceil(0.5 * len(data_loader))) == 0:
-                    # Run validation step
-                    print(f"\n{bcolors.WARNING}Running validation step...{bcolors.ENDC}\n")
-                    for (x_validation, labels_validation) in data_loader_validation:
-                        loss_validation = validation_step_hetsiren(graphdef, state, x_validation, labels_validation, md_columns, rng)
-                        total_validation_loss += loss_validation
+                # # Summary writer (validation loss)
+                # if step % int(np.ceil(0.5 * steps_per_epoch)) == 0:
+                #     # Run validation step
+                #     pbar.set_postfix_str(f"{bcolors.WARNING}Running validation step...{bcolors.ENDC}")
+                #     for _ in range(steps_per_val):
+                #         (x_validation, labels_validation) = next(iter_data_loader_val)
+                #         loss_validation = validation_step_hetsiren(graphdef, state, x_validation, labels_validation, md_columns, rng)
+                #         total_validation_loss += loss_validation
+                #         step_validation += 1
+                #     writer.add_scalars('Reconstruction loss (HetSIREN)',
+                #                        {"validation": total_validation_loss / step_validation},
+                #                        i * steps_per_epoch + step)
 
-                        step_validation += 1
-
-                    writer.add_scalars('Reconstruction loss (HetSIREN)',
-                                       {"validation": total_validation_loss / step_validation},
-                                       i * len(data_loader) + step)
+                # Progress bar update  (TQDM)
+                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f} | graph_lambda={graph_lambda:.5f}")
 
                 step += 1
-
-            # Log intermediate results at the end of the epoch
-            # Get first 5 images from batch
-            if hetsiren.isTomoSIREN:
-                x_for_tb = x[0][:5]
-            else:
-                x_for_tb = x[:5]
-            labels_for_tb = labels[:5]
-
-            # Decode some images and show them in Tensorboard
-            x_pred_intermediate, latents_intermediate = hetsiren_decode_image(graphdef, state, x_for_tb,
-                                                                              labels_for_tb, md_columns,
-                                                                              ctf_type=args.ctf_type, return_latent=True,
-                                                                              corrupt_projection_with_ctf=True)
-            x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
-            writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
-
-            # Decode some states and show them in Tensorboard
-            volumes_intermediate = hetsiren_decode_volume(graphdef, state, latents_intermediate)
-            writer.add_volumes_slices(volumes_intermediate)
-
-            # Log landscape stored in memory bank
-            if i % 5 == 0:
-                hetsiren_intermediate, _ = nnx.merge(graphdef, state)
-                random_indices = jnr.choice(hetsiren_intermediate.choice_key, a=jnp.arange(hetsiren_intermediate.bank_size), shape=(hetsiren_intermediate.subset_size,), replace=False)
-                latents_intermediate = hetsiren_intermediate.memory_bank.value[random_indices]
-                latents_data_loader = NumpyGenerator(latents_intermediate).return_tf_dataset(preShuffle=False, shuffle=False, batch_size=args.batch_size)
-                latents_images = []
-                for (latents, _) in latents_data_loader:
-                    random_labels = jnp.asarray(np.random.randint(low=0, high=len(generator.md), size=(latents.shape[0],)), dtype=jnp.int32)
-                    x_pred_intermediate = hetsiren_decode_image(graphdef, state, latents, random_labels,
-                                                                md_columns, ctf_type=None, return_latent=False,
-                                                                corrupt_projection_with_ctf=False)
-                    x_pred_intermediate = image_resize(x_pred_intermediate[..., None], (latents.shape[0], 128, 128, 1), method="bilinear")[..., 0]
-                    latents_images.append(np.asarray(x_pred_intermediate))
-                latents_images = np.concatenate(latents_images, axis=0)
-                latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)
-                latent_images_max = latents_images.max(axis=(1, 2), keepdims=True)
-                latents_images = (latents_images - latent_images_min) / (latent_images_max - latent_images_min)
-                latents_images = torch.from_numpy(latents_images)[:, None, ...]
-                writer.add_embedding(latents_intermediate, label_img=latents_images, tag="HetSIREN latent space", global_step=i)
-
-                # Save checkpoint model
-                NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "HetSIREN_CHECKPOINT"), epoch=i)
 
         hetsiren, optimizer = nnx.merge(graphdef, state)
 
@@ -1362,7 +1707,7 @@ def main():
         writer.add_images("Predicted images batch", x_pred_example, dataformats="NHWC")
 
         # Save model
-        NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN"), mode="pickle")
+        NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN"))
 
         # Remove checkpoint
         shutil.rmtree(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"))
@@ -1378,62 +1723,75 @@ def main():
             return -jnp.rad2deg(euler_from_matrix_batch(matrix))
 
         # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False,
-                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
+        data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
+                                                     num_workers=0, load_to_ram=args.load_images_to_ram)
+        steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
-        # Jitted prediction function
-        predict_fn = jax.jit(hetsiren.__call__)
+        # Jitted prediction functions
+        @nnx.jit
+        def predict_fn(model, x, labels, md, sr):
+            pad_factor = model.phys_decoder.pad_factor
+            # Wiener filter if precorrect CTF mode
+            if args.ctf_type is not None:
+                defocusU = md["ctfDefocusU"][labels]
+                defocusV = md["ctfDefocusV"][labels]
+                defocusAngle = md["ctfDefocusAngle"][labels]
+                cs = md["ctfSphericalAberration"][labels]
+                kv = md["ctfVoltage"][labels][0]
+                ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                                 sr, [pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
+                                 x.shape[0], True)
+            else:
+                ctf = jnp.ones([x.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
+                               dtype=x.dtype)
+
+            # Prepare input images for encoder
+            shifts_x_in = md["shifts"][labels]
+            x_in = wiener2DFilter(x[..., 0], ctf, pad_factor=pad_factor)[..., None]
+            x_in = apply_batch_translations(x_in, shifts_x_in)
+            return model(x_in)
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting HetSIREN latents... ######")
         latents = []
         euler_angles = []
         shifts = []
+
         # For progress bar (TQDM)
-        pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=",
-                    colour="green")
+        pbar = tqdm(range(steps_per_epoch), file=sys.stdout, ascii=" >=", colour="green",
+                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
-        for (x, labels) in pbar:
-            if isinstance(x, tuple):
-                x = x[0]
+        with closing(iter(data_loader)) as iter_data_loader:
+            for _ in pbar:
+                (x, labels) = next(iter_data_loader)
+                if isinstance(x, tuple):
+                    x = x[0]
 
-            # Wiener filter if precorrect CTF mode
-            if args.ctf_type == "precorrect":
-                defocusU = md_columns["ctfDefocusU"][labels]
-                defocusV = md_columns["ctfDefocusV"][labels]
-                defocusAngle = md_columns["ctfDefocusAngle"][labels]
-                cs = md_columns["ctfSphericalAberration"][labels]
-                kv = md_columns["ctfVoltage"][labels][0]
-                ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
-                                 args.sr, [2 * hetsiren.xsize, int(2 * 0.5 * hetsiren.xsize + 1)],
-                                 x.shape[0], True)
-                x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+                latents_batch, (rotations_rigid, shifts_rigid) = predict_fn(hetsiren, x, labels, md_columns, args.sr)
 
-            latents_batch, (rotations_rigid, shifts_rigid) = predict_fn(x)
+                # Precompute batch aligments
+                rotations_batch = md_columns["euler_angles"][labels]
 
-            # Precompute batch aligments
-            rotations_batch = md_columns["euler_angles"][labels]
+                # Precompute batch shifts
+                shifts_batch = md_columns["shifts"][labels]
 
-            # Precompute batch shifts
-            shifts_batch = md_columns["shifts"][labels]
+                # Get rotation matrices
+                if rotations_batch.ndim == 2:
+                    rotations_batch = euler_matrix_batch(rotations_batch[:, 0], rotations_batch[:, 1], rotations_batch[:, 2])
 
-            # Get rotation matrices
-            if rotations_batch.ndim == 2:
-                rotations_batch = euler_matrix_batch(rotations_batch[:, 0], rotations_batch[:, 1], rotations_batch[:, 2])
+                # Consider refinement and rigid registration alignments
+                rotations_refined = jnp.matmul(rotations_batch, rotations_rigid)
+                shifts_refined = shifts_batch + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations_batch, "b m n -> b n m"))[:, 0, :2]
 
-            # Consider refinement and rigid registration alignments
-            rotations_refined = jnp.matmul(rotations_batch, rotations_rigid)
-            shifts_refined = shifts_batch + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations_batch, "b m n -> b n m"))[:, 0, :2]
+                # Convert rotation to Euler angles in Xmipp format
+                euler_angles_refined = xmippEulerFromMatrix(rotations_refined)
 
-            # Convert rotation to Euler angles in Xmipp format
-            euler_angles_refined = xmippEulerFromMatrix(rotations_refined)
+                # Convert to Numpy
+                euler_angles_refined, shifts_refined = np.array(euler_angles_refined), np.array(shifts_refined)
 
-            # Convert to Numpy
-            euler_angles_refined, shifts_refined = np.array(euler_angles_refined), np.array(shifts_refined)
-
-            latents.append(latents_batch)
-            euler_angles.append(euler_angles_refined)
-            shifts.append(shifts_refined)
+                latents.append(latents_batch)
+                euler_angles.append(euler_angles_refined)
+                shifts.append(shifts_refined)
         latents = np.asarray(jnp.concatenate(latents, axis=0))
         euler_angles = np.asarray(jnp.concatenate(euler_angles, axis=0))
         shifts = np.asarray(jnp.concatenate(shifts, axis=0))
@@ -1449,8 +1807,5 @@ def main():
         md.write(os.path.join(args.output_path, "predicted_latents" + os.path.splitext(args.md)[1]))
 
     # If exists, clean MMAP
-    if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
-        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
-
-if __name__ == "__main__":
-    main()
+    # if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
+    #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))

@@ -1,2 +1,3 @@
 from .estimate_latent_covariances import estimate_latent_covariances
 from .modart import single_step_modart, MoDART
+from .gaussian_volume_fitting import fit_volume, fit_images, adjust_weights_to_images, splat_weights_trilinear, FastVariableBlur3D

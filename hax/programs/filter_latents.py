@@ -22,7 +22,7 @@ def main():
                              f"to monitor and/or measure memory usage and adjust this value")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the filtered latent space")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     # Load latents
     latents = np.load(args.latents)
@@ -32,6 +32,3 @@ def main():
 
     # Save space
     np.save(os.path.join(args.output_path, "filtered_latents.npy"), output)
-
-if __name__ == '__main__':
-    main()

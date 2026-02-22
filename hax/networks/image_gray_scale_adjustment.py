@@ -15,25 +15,29 @@ from hax.utils import *
 
 
 class ImageAdjustment(nnx.Module):
+
+    @save_config
     def __init__(self, xsize, lat_dim=10, predict_value=False, *, rngs: nnx.Rngs):
         self.xsize = xsize
         self.predict_value = predict_value
 
         # Gray level adjustment (TODO: with 256 features OK)
-        self.hidden_layers_ds = [nnx.Linear(xsize * xsize, 32, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers_ds = [nnx.Linear(xsize * xsize, 32, rngs=rngs, dtype=jnp.bfloat16)]
         for _ in range(2):
-            self.hidden_layers_ds.append(nnx.Linear(32, 32, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_layers_us = [nnx.Linear(lat_dim, 32, rngs=rngs, dtype=jnp.bfloat16)]
+            hidden_layers_ds.append(nnx.Linear(32, 32, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_ds = nnx.List(hidden_layers_ds)
+        hidden_layers_us = [nnx.Linear(lat_dim, 32, rngs=rngs, dtype=jnp.bfloat16)]
         for _ in range(2):
-            self.hidden_layers_us.append(nnx.Linear(32, 32, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_us.append(nnx.Linear(32, 32, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_us = nnx.List(hidden_layers_us)
         self.latent = nnx.Linear(32, lat_dim, rngs=rngs)
 
         if predict_value:
-            self.a = nnx.Linear(32, 1, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.ones)
-            self.b = nnx.Linear(32, 1, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.zeros)
+            self.a = nnx.Linear(32, 1, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.ones_init())
+            self.b = nnx.Linear(32, 1, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
         else:
-            self.a = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.ones)
-            self.b = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.zeros)
+            self.a = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.ones_init())
+            self.b = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
 
     def __call__(self, x):
         if x.ndim == 4:
@@ -127,7 +131,7 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
             images = ctfFilter(images, ctf * ctf, pad_factor=2)
 
         # Apply gray level correction
-        x = a * x + b
+        images = a * images + b
 
         # Loss
         loss = dm_pix.mse(images[..., None], x[..., None]).mean()
@@ -160,7 +164,7 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
 
     loss, grads = grad_fn(model, x, coords, values)
 
-    optimizer.update(grads)
+    optimizer.update(model, grads)
 
     state = nnx.state((model, optimizer))
 
@@ -274,6 +278,7 @@ def main():
     import shutil
     from xmipp_metadata.image_handler import ImageHandler
     import optax
+    from contextlib import closing
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.networks import train_step_image_adjustment
@@ -325,7 +330,10 @@ def main():
                         help="Path to save the results (trained neural network, new metadata...)")
     parser.add_argument("--reload", required=False, type=str,
                         help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)")
-    args = parser.parse_args()
+    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
+                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
+                             f"the default disk.")
+    args, _ = parser.parse_known_args()
 
     # Check that training and validation fractions add up to one
     if sum(args.dataset_split_fraction) != 1:
@@ -342,14 +350,6 @@ def main():
         mask = ImageHandler().generateMask(inputFn=vol, boxsize=64)
         ImageHandler().write(mask, os.path.join(args.output_path, "mask.mrc"), sr=args.sr)
 
-    # Data loading approach
-    if args.load_images_to_ram:
-        mmap = False
-        mmap_output_dir = None
-    else:
-        mmap = True
-        mmap_output_dir = args.output_path
-
     inds = np.asarray(np.where(mask > 0.0)).T
     values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
 
@@ -361,6 +361,12 @@ def main():
     generator = MetaDataGenerator(args.md)
     md_columns = extract_columns(generator.md)
 
+    # Prepare grain dataset
+    if not args.load_images_to_ram and args.mode in ["train", "predict"]:
+        mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
+        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
+                                             precision=np.float16, group_size=1, shard_size=10000)
+
     # Prepare network
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     rng, model_key = jax.random.split(rng, 2)
@@ -368,7 +374,7 @@ def main():
 
     # Reload network
     if args.reload is not None:
-        imageAdjustment = NeuralNetworkCheckpointer.load(imageAdjustment, os.path.join(args.reload, "imageAdjustment"))
+        imageAdjustment = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "imageAdjustment"))
 
     # Train network
     if args.mode == "train":
@@ -379,39 +385,75 @@ def main():
         writer = JaxSummaryWriter(os.path.join(args.output_path, "Image_adjustment_metrics"))
 
         # Prepare data loader
-        _, data_loader, data_loader_validation = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
-                                                                             mmap=mmap, mmap_output_dir=mmap_output_dir, split_fraction=args.dataset_split_fraction)
+        data_loader_train, data_loader_val = generator.return_grain_dataset(batch_size=args.batch_size,
+                                                                            shuffle="global", num_epochs=None,
+                                                                            num_workers=-1, num_threads=1,
+                                                                            split_fraction=args.dataset_split_fraction,
+                                                                            load_to_ram=args.load_images_to_ram)
+        steps_per_epoch = int(int(args.dataset_split_fraction[0] * len(generator.md)) / args.batch_size)
+        steps_per_val = int(int(args.dataset_split_fraction[1] * len(generator.md)) / args.batch_size)
 
         # Example of training data for Tensorboard
-        x_example, labels_example = next(iter(data_loader))
-        x_example = jax.vmap(min_max_scale)(x_example)
-        writer.add_images("Training data batch", x_example, dataformats="NHWC")
+        with closing(iter(data_loader_train)) as iter_data_loader:
+            x_example, labels_example = next(iter_data_loader)
+            x_example = jax.vmap(min_max_scale)(x_example)
+            writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
         # Optimizers
-        optimizer = nnx.Optimizer(imageAdjustment, optax.adam(args.learning_rate))
+        optimizer = nnx.Optimizer(imageAdjustment, optax.adam(args.learning_rate), wrt=nnx.Param)
         graphdef, state = nnx.split((imageAdjustment, optimizer))
 
         # Resume if checkpoint exists
         if os.path.isdir(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT")):
-            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"))
+            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"), optimizer)
             print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
         else:
             resume_epoch = 0
 
         # Training loop
         print(f"{bcolors.OKCYAN}\n###### Training image adjustment... ######")
-        for i in range(resume_epoch, args.epochs):
-            total_loss = 0
-            total_validation_loss = 0
 
-            # For progress bar (TQDM)
-            step = 1
-            step_validation = 1
-            print(f'\nTraining epoch {i + 1}/{args.epochs} |')
-            pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=",
-                        colour="green")
+        i = 0
+        pbar = tqdm(range(resume_epoch * steps_per_epoch, args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=",
+                    colour="green",
+                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
-            for (x, labels) in pbar:
+        with closing(iter(data_loader_train)) as iter_data_loader_train, closing(iter(data_loader_val)) as iter_data_loader_val:
+            for total_steps in pbar:
+                (x, labels) = next(iter_data_loader_train)
+
+                if total_steps % steps_per_epoch == 0:
+
+                    total_loss = 0
+                    total_validation_loss = 0
+
+                    # For progress bar (TQDM)
+                    step = 1
+                    pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
+
+                    # Summary writer (validation loss)
+                    if step % int(np.ceil(0.5 * steps_per_epoch)) == 0:
+                        # Run validation step
+                        pbar.set_postfix_str(f"{bcolors.WARNING}Running validation step...{bcolors.ENDC}")
+                        for _ in range(steps_per_val):
+                            (x_validation, labels_validation) = next(iter_data_loader_val)
+                            loss_validation = validation_step_image_adjustment(graphdef, state, x_validation,
+                                                                               labels_validation,
+                                                                               md_columns, args.sr, args.ctf_type,
+                                                                               coords, values)
+                            total_validation_loss += loss_validation
+
+                        writer.add_scalars('Training loss (image adjustment)',
+                                           {"validation": total_validation_loss / steps_per_val},
+                                           i * steps_per_epoch + step)
+
+                    if i % 5:
+                        # Save checkpoint model
+                        NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"),
+                                                                    epoch=i)
+
+                    i += 1
+
                 loss, state = train_step_image_adjustment(graphdef, state, x, labels, md_columns, args.sr, args.ctf_type, coords, values)
                 total_loss += loss
 
@@ -419,36 +461,17 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
                 # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
+                if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
                     writer.add_scalars('Training loss (image adjustment)',
                                        {"train": total_loss / step},
-                                       i * len(data_loader) + step)
-
-                # Summary writer (validation loss)
-                if step % int(np.ceil(0.5 * len(data_loader))) == 0:
-                    # Run validation step
-                    print(f"\n{bcolors.WARNING}Running validation step...{bcolors.ENDC}\n")
-                    for (x_validation, labels_validation) in data_loader_validation:
-                        loss_validation = validation_step_image_adjustment(graphdef, state, x_validation, labels_validation,
-                                                                           md_columns, args.sr, args.ctf_type, coords, values)
-                        total_validation_loss += loss_validation
-
-                        step_validation += 1
-
-                    writer.add_scalars('Training loss (image adjustment)',
-                                       {"validation": total_validation_loss / step_validation},
-                                       i * len(data_loader) + step)
+                                       i * steps_per_epoch + step)
 
                 step += 1
-
-            if i % 5:
-                # Save checkpoint model
-                NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"), epoch=i)
 
         imageAdjustment, optimizer = nnx.merge(graphdef, state)
 
         # Save model
-        NeuralNetworkCheckpointer.save(imageAdjustment, os.path.join(args.output_path, "imageAdjustment"), mode="pickle")
+        NeuralNetworkCheckpointer.save(imageAdjustment, os.path.join(args.output_path, "imageAdjustment"))
 
         # Remove checkpoint
         shutil.rmtree(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"))
@@ -458,32 +481,37 @@ def main():
         imageAdjustment.eval()
 
         # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False,
-                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
+        data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
+                                                     num_workers=0, load_to_ram=args.load_images_to_ram)
+        steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
         # Jitted prediction function
         predict_fn = jax.jit(imageAdjustment.__call__)
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting image adjustment... ######")
-        pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=",
-                    colour="green")
+        pbar = tqdm(range(steps_per_epoch), desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green",
+                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
         imgs_adjusted = []
         adjustment_a = []
         adjustment_b = []
-        for (x, labels) in pbar:
-            a, b = predict_fn(x)
+        with closing(iter(data_loader)) as iter_data_loader:
+            for _ in pbar:
+                (x, labels) = next(iter_data_loader)
+                a, b = predict_fn(x)
+                a = np.nan_to_num(1. / a, nan=0.0, posinf=0.0, neginf=0.0)
+                b = -b * a
 
-            # Adjust shapes of a and b
-            if imageAdjustment.predict_value:
-                adjustment_a.append(a)
-                adjustment_b.append(b)
-                a = a[:, None, None]
-                b = b[:, None, None]
+                # Adjust shapes of a and b
+                if imageAdjustment.predict_value:
+                    adjustment_a.append(a)
+                    adjustment_b.append(b)
+                    a = a[:, None, None]
+                    b = b[:, None, None]
 
-            adjustment = np.asarray(a * x[..., 0] + b)
-            imgs_adjusted.append(adjustment)
+                adjustment = np.asarray(a * x[..., 0] + b)
+                imgs_adjusted.append(adjustment)
         imgs_adjusted = np.concatenate(imgs_adjusted, axis=0)
 
         # Save new images
@@ -498,5 +526,6 @@ def main():
             md[idx, "image"] = "@".join([image_id, output_images_path])
         md.write(os.path.join(args.output_path, "adjusted_images" +  os.path.splitext(args.md)[1]))
 
-if __name__ == "__main__":
-    main()
+    # If exists, clean MMAP
+    if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
+        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))

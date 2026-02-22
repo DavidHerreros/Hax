@@ -84,9 +84,10 @@ class Encoder(nnx.Module):
     def __init__(self, input_dim, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
 
-        self.hidden_layers = [nnx.Linear(self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers = [nnx.Linear(self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         for _ in range(3):
-            self.hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers = nnx.List(hidden_layers)
 
     def __call__(self, x):
         for layer in self.hidden_layers:
@@ -100,10 +101,11 @@ class Encoder(nnx.Module):
 class Decoder(nnx.Module):
     def __init__(self, lat_dim, output_dim, *, rngs: nnx.Rngs):
 
-        self.hidden_layers = [nnx.Linear(lat_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers = [nnx.Linear(lat_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         for _ in range(3):
-            self.hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_layers.append(nnx.Linear(1024, output_dim, rngs=rngs))
+            hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        hidden_layers.append(nnx.Linear(1024, output_dim, rngs=rngs))
+        self.hidden_layers = nnx.List(hidden_layers)
 
     def __call__(self, x):
         for layer in self.hidden_layers[:-1]:
@@ -116,6 +118,8 @@ class Decoder(nnx.Module):
 
 
 class FlexConsensus(nnx.Module):
+
+    @save_config
     def __init__(self, input_spaces_dim, input_spaces_name=None, lat_dim=None, *, rngs: nnx.Rngs):
         super(FlexConsensus, self).__init__()
         self.input_spaces_dim = input_spaces_dim
@@ -127,8 +131,10 @@ class FlexConsensus(nnx.Module):
         else:
             self.input_spaces_name = input_spaces_name
 
-        self.encoders = {input_space_name + "_encoder": Encoder(input_space_dim, rngs=rngs) for input_space_dim, input_space_name in zip(input_spaces_dim, self.input_spaces_name)}
-        self.decoders = {input_space_name + "_decoder": Decoder(lat_dim, input_space_dim, rngs=rngs) for input_space_dim, input_space_name in zip(input_spaces_dim, self.input_spaces_name)}
+        self.encoders = nnx.Dict({input_space_name + "_encoder": Encoder(input_space_dim, rngs=rngs)
+                                  for input_space_dim, input_space_name in zip(input_spaces_dim, self.input_spaces_name)})
+        self.decoders = nnx.Dict({input_space_name + "_decoder": Decoder(lat_dim, input_space_dim, rngs=rngs)
+                                  for input_space_dim, input_space_name in zip(input_spaces_dim, self.input_spaces_name)})
         self.consensus_space = nnx.Linear(1024, lat_dim, rngs=rngs)
 
     def __call__(self, x, space_name_encoder=None, space_name_decoder=None):
@@ -221,7 +227,7 @@ def train_step_flexconsensus(graphdef, state, x):
         grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
         (loss, (encoder_loss, decoder_loss)), grads = grad_fn(model, x, input_space_idx)
 
-        optimizer.update(grads)
+        optimizer.update(model, grads)
 
         # Save losses
         encoder_losses += encoder_loss
@@ -246,6 +252,7 @@ def main():
     import numpy as np
     import argparse
     import optax
+    from contextlib import closing
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import ArrayListGenerator, NumpyGenerator
     from hax.metrics import JaxSummaryWriter
@@ -283,7 +290,7 @@ def main():
                         help="Path to save the results (trained neural network, consensus spaces...)")
     parser.add_argument("--reload", required=False, type=str,
                         help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     # If NAME:path convention, split both
     if ":" in args.input_space[0]:
@@ -329,7 +336,7 @@ def main():
 
     # Reload network
     if args.reload is not None:
-        flexconsensus = NeuralNetworkCheckpointer.load(flexconsensus, os.path.join(args.reload, "FlexConsensus"))
+        flexconsensus = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "FlexConsensus"))
 
     # Train network
     if args.mode == "train":
@@ -346,25 +353,48 @@ def main():
             return model(x, space_name_encoder, space_name_decoder)
 
         # Prepare data loader
-        data_loader = ArrayListGenerator(input_spaces).return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True)
+        data_loader = ArrayListGenerator(input_spaces).return_grain_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
+                                                                            num_workers=-1, num_epochs=None)
+        steps_per_epoch = int(np.ceil(input_spaces[0].shape[0] / args.batch_size))
 
         # Optimizers (FlexConsensus)
-        optimizer = nnx.Optimizer(flexconsensus, optax.adam(args.learning_rate))
+        optimizer = nnx.Optimizer(flexconsensus, optax.adam(args.learning_rate), wrt=nnx.Param)
         graphdef, state = nnx.split((flexconsensus, optimizer))
 
         # Training loop (FlexConsensus)
         print(f"{bcolors.OKCYAN}\n###### Training consensus... ######")
-        for i in range(args.epochs):
-            total_loss = 0
-            total_encoder_loss = 0
-            total_decoder_loss = {input_space_name: 0 for input_space_name in flexconsensus.input_spaces_name}
+        i = 0
+        pbar = tqdm(range(args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=", colour="green",
+                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+        with closing(iter(data_loader)) as iter_data_loader:
+            for total_steps in pbar:
+                (x, _) = next(iter_data_loader)
+                if total_steps % steps_per_epoch == 0:
+                    total_loss = 0
+                    total_encoder_loss = 0
+                    total_decoder_loss = {input_space_name: 0 for input_space_name in flexconsensus.input_spaces_name}
 
-            # For progress bar (TQDM)
-            step = 1
-            print(f'\nTraining epoch {i + 1}/{args.epochs} |')
-            pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
+                    # For progress bar (TQDM)
+                    step = 1
+                    pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
-            for (x, _) in pbar:
+                    if i % 5 == 0:
+                        tensorboard_latents = []
+                        labels_tensorboard = []
+                        for input_space, input_space_name in zip(input_spaces, input_spaces_name):
+                            max_idx = min(2048, input_space.shape[0])
+                            input_space = input_space[:max_idx]
+                            encoded = predict_flexconsensus(graphdef, state, input_space,
+                                                            space_name_encoder=input_space_name,
+                                                            space_name_decoder=None)
+                            tensorboard_latents.append(np.array(encoded))
+                            labels_tensorboard += [f"{input_space_name}" for _ in range(max_idx)]
+                        tensorboard_latents = np.concatenate(tensorboard_latents, axis=0)
+                        writer.add_embedding(tensorboard_latents, metadata=labels_tensorboard,
+                                             tag="FlexConsensus latent space", global_step=i)
+
+                    i += 1
+
                 loss, encoder_loss, decoder_loss, state = train_step_flexconsensus(graphdef, state, x)
                 total_loss += loss
                 total_encoder_loss += encoder_loss
@@ -375,36 +405,23 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f} | encoder_loss={encoder_loss / step:.5f} | " + loss_str_decoder_loss)
 
                 # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
+                if step % int(np.ceil(0.5 * steps_per_epoch)) == 0:
                     writer.add_scalar('Training loss (FlexConsensus)',
                                       total_loss / step,
-                                      i * len(data_loader) + step)
+                                      i * steps_per_epoch + step)
                     writer.add_scalar('Encoder loss (FlexConsensus)',
                                       encoder_loss / step,
-                                      i * len(data_loader) + step)
+                                      i * steps_per_epoch + step)
                     for key, value in total_decoder_loss.items():
                         writer.add_scalar(f'Decoder loss ({key})',
                                           value / step,
-                                          i * len(data_loader) + step)
+                                          i * steps_per_epoch + step)
                 step += 1
-
-            if i % 5 == 0:
-                tensorboard_latents = []
-                labels_tensorboard = []
-                for input_space, input_space_name in zip(input_spaces, input_spaces_name):
-                    max_idx = min(2048, input_space.shape[0])
-                    input_space = input_space[:max_idx]
-                    encoded = predict_flexconsensus(graphdef, state, input_space, space_name_encoder=input_space_name, space_name_decoder=None)
-                    tensorboard_latents.append(np.array(encoded))
-                    labels_tensorboard += [f"{input_space_name}" for _ in range(max_idx)]
-                tensorboard_latents = np.concatenate(tensorboard_latents, axis=0)
-                writer.add_embedding(tensorboard_latents, metadata=labels_tensorboard,
-                                     tag="FlexConsensus latent space", global_step=i)
 
         flexconsensus, optimizer = nnx.merge(graphdef, state)
 
         # Save model
-        NeuralNetworkCheckpointer.save(flexconsensus, os.path.join(args.output_path, "FlexConsensus"), mode="pickle")
+        NeuralNetworkCheckpointer.save(flexconsensus, os.path.join(args.output_path, "FlexConsensus"))
 
     elif args.mode == "predict":
 
@@ -421,19 +438,24 @@ def main():
             print(f"Predicting input space {idx + 1}/{len(input_spaces)}")
 
             # Prepare data loader
-            data_loader = NumpyGenerator(input_spaces[idx]).return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False)
+            data_loader = NumpyGenerator(input_spaces[idx]).return_grain_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False,
+                                                                                 num_workers=0, num_epochs=1)
+            steps_per_epoch = int(np.ceil(input_spaces[0].shape[0] / args.batch_size))
 
             if input_spaces_name is not None and input_spaces_name[idx] in flexconsensus.input_spaces_name:
                 print(f"Valid identifier {input_spaces_name[idx]} provided for this input")
                 consensus_latents = []
                 decoded_latents = []
                 # For progress bar (TQDM)
-                pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
+                pbar = tqdm(range(steps_per_epoch), desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green",
+                            bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
-                for (x, _) in pbar:
-                    encoded, decoded = predict_fn(x, input_spaces_name[idx], input_spaces_name[idx])
-                    consensus_latents.append(encoded)
-                    decoded_latents.append(decoded)
+                with closing(iter(data_loader)) as iter_data_loader:
+                    for _ in pbar:
+                        (x, _) = next(iter_data_loader)
+                        encoded, decoded = predict_fn(x, input_spaces_name[idx], input_spaces_name[idx])
+                        consensus_latents.append(encoded)
+                        decoded_latents.append(decoded)
             else:
                 print(f"Matching and detecting best possible prediction (due to missing or not valid identifier)")
                 representation_error = jnp.inf
@@ -449,15 +471,18 @@ def main():
                         print(f"Trying with {input_space_name}")
 
                         # For progress bar (TQDM)
-                        pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
+                        pbar = tqdm(range(steps_per_epoch), desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green",
+                                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
-                        for (x, _) in pbar:
-                            encoded, decoded = predict_fn(x, input_space_name, input_space_name)
-                            consensus_latents_trial.append(encoded)
-                            decoded_latents_trial.append(decoded)
-                            representation_error_trial += jnp.mean(jnp.square(x - decoded), axis=-1).mean()
+                        with closing(iter(data_loader)) as iter_data_loader:
+                            for _ in pbar:
+                                (x, _) = next(iter_data_loader)
+                                encoded, decoded = predict_fn(x, input_space_name, input_space_name)
+                                consensus_latents_trial.append(encoded)
+                                decoded_latents_trial.append(decoded)
+                                representation_error_trial += jnp.mean(jnp.square(x - decoded), axis=-1).mean()
 
-                        representation_error_trial /= len(data_loader)
+                        representation_error_trial /= steps_per_epoch
 
                         if representation_error_trial < representation_error:
                             consensus_latents = consensus_latents_trial
@@ -485,14 +510,27 @@ def main():
             # Consensus error
             for input_space_name in flexconsensus.input_spaces_name:
                 # [1] Decode current consensus space with one of the decoders
-                data_loader = NumpyGenerator(consensus_latent).return_tf_dataset(batch_size=args.batch_size,
-                                                                                  shuffle=False, preShuffle=False)
-                decoded = jnp.concatenate([predict_fn(x, None, input_space_name) for (x, _) in data_loader], axis=0)
+                steps_per_epoch = int(np.ceil(input_spaces.shape[0] / args.batch_size))
+                data_loader = NumpyGenerator(consensus_latent).return_grain_dataset(batch_size=args.batch_size,
+                                                                                    shuffle=False, preShuffle=False,
+                                                                                    num_epochs=1, num_workers=0)
+                decoded = []
+                with closing(iter(data_loader)) as iter_data_loader:
+                    for _ in range(steps_per_epoch):
+                        (x, _) = next(iter_data_loader)
+                        decoded.append(predict_fn(x, None, input_space_name))
+                decoded = jnp.concatenate(decoded, axis=0)
 
                 # [2] Encode the decoded space using the same encoder ID as the decoder previously used
-                data_loader = NumpyGenerator(np.array(decoded)).return_tf_dataset(batch_size=args.batch_size,
-                                                                                  shuffle=False, preShuffle=False)
-                encoded = jnp.concatenate([predict_fn(x, input_space_name, None) for (x, _) in data_loader], axis=0)
+                data_loader = NumpyGenerator(np.array(decoded)).return_grain_dataset(batch_size=args.batch_size,
+                                                                                     shuffle=False, preShuffle=False,
+                                                                                     num_epochs=1, num_workers=0)
+                encoded = []
+                with closing(iter(data_loader)) as iter_data_loader:
+                    for _ in range(steps_per_epoch):
+                        (x, _) = next(iter_data_loader)
+                        encoded.append(predict_fn(x, input_space_name, None))
+                encoded = jnp.concatenate(encoded, axis=0)
 
                 # [3] Compute consensus error for the current consensus - encoded pair
                 diffs = consensus_latent - encoded
@@ -509,6 +547,3 @@ def main():
             np.save(output_file_consensus, latent)
             np.save(output_file_consensus_errors, latent_error)
             np.save(output_file_representation_errors, representation_error)
-
-if __name__ == "__main__":
-    main()
