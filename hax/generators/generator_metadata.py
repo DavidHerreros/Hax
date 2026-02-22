@@ -582,7 +582,7 @@ class MetaDataGenerator:
                 dataset_val = dataset_val.repeat(num_epochs)
 
             if num_threads > 1:
-                read_options = grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=1)
+                read_options = grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=500)
             else:
                 read_options = None
 
