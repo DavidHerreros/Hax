@@ -401,7 +401,7 @@ def training_step_volume(graphdef, state, target, update=True):
 
         recon_loss = jnp.mean((recon - target) ** 2.)
 
-        l1_loss = 0.001 * jnp.mean(jnp.abs(recon))
+        l1_loss = 0.1 * jnp.mean(jnp.abs(recon))
 
         # diff_x = recon[1:, :, :] - recon[:-1, :, :]
         # diff_y = recon[:, 1:, :] - recon[:, :-1, :]
