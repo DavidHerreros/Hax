@@ -223,16 +223,34 @@ def train_step_flexconsensus(graphdef, state, x):
 
         return loss, (single_space_loss + shannon_mapping_loss + center_of_mass_loss, representation_loss)
 
+    accumulated_grads = None
     for input_space_idx in range(len(model.input_spaces_name)):
         grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
         (loss, (encoder_loss, decoder_loss)), grads = grad_fn(model, x, input_space_idx)
 
-        optimizer.update(model, grads)
+        # Accumulate the gradients
+        if accumulated_grads is None:
+            accumulated_grads = grads
+        else:
+            # Add current gradients to the accumulated gradients
+            accumulated_grads = jax.tree.map(
+                lambda acc, g: acc + g,
+                accumulated_grads,
+                grads
+            )
 
         # Save losses
         encoder_losses += encoder_loss
         decoder_losses[model.input_spaces_name[input_space_idx]] = decoder_loss
         total_losses += loss
+
+    # Average accumulated grads
+    accumulated_grads = jax.tree.map(
+        lambda g: g / len(model.input_spaces_name),
+        accumulated_grads
+    )
+
+    optimizer.update(model, accumulated_grads)
 
     encoder_losses /= len(model.input_spaces_name)
     total_losses /= len(model.input_spaces_name)
@@ -405,7 +423,7 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f} | encoder_loss={encoder_loss / step:.5f} | " + loss_str_decoder_loss)
 
                 # Summary writer (training loss)
-                if step % int(np.ceil(0.5 * steps_per_epoch)) == 0:
+                if step % int(np.ceil(0.9 * steps_per_epoch)) == 0:
                     writer.add_scalar('Training loss (FlexConsensus)',
                                       total_loss / step,
                                       i * steps_per_epoch + step)
