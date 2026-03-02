@@ -88,6 +88,13 @@ def main():
                              f"to monitor and/or measure memory usage and adjust this value")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the estimated covariances")
+    parser.add_argument("--load_images_to_ram", action='store_true',
+                        help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
+                             f"images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance "
+                             f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
+    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
+                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
+                             f"the default disk.")
     args, _ = parser.parse_known_args()
 
     # Load neural network (note it MUST be saved in pickle mode to make this script general)
@@ -97,12 +104,21 @@ def main():
     generator = MetaDataGenerator(args.md)
     md_columns = extract_columns(generator.md)
 
+    # Prepare grain dataset
+    if not args.load_images_to_ram:
+        mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
+        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
+                                             precision=np.float16, group_size=1, shard_size=10000)
+
     # Prepare data loader
-    data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False, prefetch=20)
+    data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
+                                                 num_workers=6, load_to_ram=args.load_images_to_ram)
+    steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
     # Estimate covariances
     print(f"{bcolors.OKCYAN}\n###### Estimating covariance matrices... ######")
-    pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
+    pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green", total=steps_per_epoch,
+                bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
     covariances = []
     latents = []
     for (x, labels) in pbar:
