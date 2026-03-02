@@ -469,8 +469,8 @@ class MetaDataGenerator:
 
             shard_paths = glob(os.path.join(self.mmap_output_dir, "dataset-*"))
             shard_paths.sort()
-            source = LazyNinjaGrainSource(shard_paths)
-            dataset_train = grain.MapDataset.source(source)
+            sources = LazyNinjaGrainSource(shard_paths)
+            dataset_train = grain.MapDataset.source(sources)
             if split_fraction is not None:
                 dataset_val = grain.MapDataset.source(source)
 
@@ -488,10 +488,10 @@ class MetaDataGenerator:
                 def __getitem__(self, idx):
                     return self._data[idx], idx
 
-            source = NumpyDataSource(images)
-            dataset_train = grain.MapDataset.source(source)
+            sources = NumpyDataSource(images)
+            dataset_train = grain.MapDataset.source(sources)
             if split_fraction is not None:
-                dataset_val = grain.MapDataset.source(source)
+                dataset_val = grain.MapDataset.source(sources)
 
         else:
             raise ValueError("Unknown grain dataset type")
@@ -573,37 +573,39 @@ class MetaDataGenerator:
                 dataset_val = dataset_val.mp_prefetch(options=mp_options)
 
         else:
+            # Operations
+            operations = []
             if self.grain_dataset_type == "ArrayRecord":
-                dataset_train = dataset_train.map(parse_and_decompress)
-                if split_fraction is not None:
-                    dataset_val = dataset_val.map(parse_and_decompress)
+                class ParseAndDecompress(grain.transforms.Map):
+                    def map(self, x):
+                        return parse_and_decompress(x)
+                operations = [ParseAndDecompress()]
+            operations.append(grain.transforms.Batch(batch_size=batch_size))
 
-            dataset_train = dataset_train.repeat(num_epochs)
-            if split_fraction is not None:
-                dataset_val = dataset_val.repeat(num_epochs)
-
-            if num_threads > 1:
-                read_options = grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=500)
-            else:
-                read_options = None
-
-            dataset_train = dataset_train.to_iter_dataset(read_options=read_options).batch(batch_size)
-            if split_fraction is not None:
-                dataset_val = dataset_val.to_iter_dataset(read_options=read_options).batch(batch_size)
-
-            if num_workers == -1:
-                performance_configs = grain.experimental.pick_performance_config(
-                    ds=dataset_train,
-                    ram_budget_mb=1024,
-                    max_workers=12,
-                    max_buffer_size=None
+            # Index sampler
+            if num_epochs == 1:
+                sampler_train = grain.samplers.SequentialSampler(
+                    num_records=len(sources),
+                    shard_options=grain.sharding.NoSharding()
                 )
-                mp_options = performance_configs.multiprocessing_options
             else:
-                mp_options = grain.multiprocessing.MultiprocessingOptions(num_workers=num_workers, per_worker_buffer_size=2)
-            dataset_train = dataset_train.mp_prefetch(options=mp_options)
+                sampler_train = grain.samplers.IndexSampler(
+                    num_records=len(sources),
+                    shuffle=False,
+                    num_epochs=num_epochs,
+                    shard_options=grain.sharding.NoSharding()
+                )
+
+            # Data loader
+            # The DataLoader coordinates the workers and the sampler
+            dataset_train = grain.DataLoader(
+                data_source=sources,
+                sampler=sampler_train,
+                operations=operations,
+                worker_count=num_workers,
+            )
             if split_fraction is not None:
-                dataset_val = dataset_val.mp_prefetch(options=mp_options)
+                dataset_val = None  # Not implemented, no shuffling is intended to be used for prediction steps
 
         if split_fraction is not None:
             return dataset_train, dataset_val
