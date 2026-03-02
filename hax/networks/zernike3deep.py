@@ -182,12 +182,8 @@ class MultiEncoder(nnx.Module):
         self.hidden_layers_refinement = nnx.List(hidden_layers_refinement)
 
         # Rigid registration of volumes
-        self.rigid_6d_rotation = nnx.Linear(256, 6, rngs=rngs)
-        self.rigid_shifts = nnx.Linear(256, 3, rngs=rngs)
-
-        # Refinement control (residual learning)
-        self.alpha_rigid_rotations = nnx.Param(1e-4)
-        self.alpha_rigid_shifts = nnx.Param(1e-4)
+        self.rigid_6d_rotation = nnx.Linear(256, 6, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
+        self.rigid_shifts = nnx.Linear(256, 2, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
 
     def sample_gaussian(self, mean, logstd, *, rngs):
         return logstd * jnr.normal(rngs, shape=mean.shape) + mean
@@ -204,11 +200,11 @@ class MultiEncoder(nnx.Module):
             # Estimate rotations for volume registration
             rotations_6d = self.rigid_6d_rotation(x_ref)
             identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
-            rotations_6d = identity_6d + self.alpha_rigid_rotations * rotations_6d
+            rotations_6d = identity_6d + rotations_6d
             rotations_rigid = PoseDistMatrix.mode_rotmat(rotations_6d)
 
             # Estimate shifts for volume registration
-            shifts_rigid = self.alpha_rigid_shifts * self.rigid_shifts(x_ref)
+            shifts_rigid = self.rigid_shifts(x_ref)
 
         for layer in self.hidden_layers_latent:
             x = nnx.relu(x + layer(x))
@@ -294,7 +290,7 @@ class PhysDecoder(nnx.Module):
         self.xsize = xsize
 
         # Gray level adjustment
-        self.imageAdjustment = ImageAdjustment(lat_dim=lat_dim, xsize=xsize, predict_value=True, rngs=rngs)
+        # self.imageAdjustment = ImageAdjustment(lat_dim=lat_dim, xsize=xsize, predict_value=True, rngs=rngs)
 
     def __call__(self, flow, x, coords, values, xsize, rotations, shifts, ctf, ctf_type, sigma):
         # Indices to coords
@@ -344,12 +340,13 @@ class PhysDecoder(nnx.Module):
             images = ctfFilter(images, ctf, pad_factor=2)
 
         # Gray level adjustment
-        x_nc = jnp.squeeze(x)
-        if x_nc.ndim == 2:
-            x_nc = x_nc[None, ...]
-        a, b = self.imageAdjustment(x_nc)
-        if a.ndim == 1:
-            a, b = a[:, None, None], b[:, None, None]
+        # x_nc = jnp.squeeze(x)
+        # if x_nc.ndim == 2:
+        #     x_nc = x_nc[None, ...]
+        # a, b = self.imageAdjustment(x_nc)
+        # if a.ndim == 1:
+        #     a, b = a[:, None, None], b[:, None, None]
+        a, b = 1.0, 0.0
 
         return images, (a, b)
 
@@ -470,14 +467,14 @@ class Zernike3Deep(nnx.Module):
         if x.ndim == 4:
             # Consider refinement and rigid registration alignments
             rotations = jnp.matmul(rotations, rotations_rigid)
-            shifts = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
+            shifts = shifts + (0.5 * self.xsize) * shifts_rigid
 
         # Check if CTF corruption is needed
         if not corrupt_projection_with_ctf:
             ctf_type = None
 
         # Generate projections
-        images_corrected, _ = self.phys_decoder(flow, x, self.coords, self.values, self.xsize, rotations, shifts, ctf, ctf_type, self.sigma)
+        images_corrected, _ = self.phys_decoder(flow, x, self.coords, self.values, self.xsize, rotations, shifts, ctf, ctf_type, self.sigma.get_value())
 
         if return_latent:
             return images_corrected, latent
@@ -529,6 +526,13 @@ class Zernike3Deep(nnx.Module):
 
         return grids
 
+    def decode_field(self, x):
+        if x.ndim == 4:
+            x, _ = self(x)
+
+        flow = self.flow_decoder(x, self.coords, self.xsize)[0] / self.flow_decoder.factor
+        return flow, self.coords
+
 @jax.jit
 def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True):
     model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
@@ -574,46 +578,35 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
 
         # Refine angular alignment
         rotations_refined = jnp.matmul(rotations, rotations_rigid)
-        shifts_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
+        shifts_refined = shifts + (0.5 * model.xsize) * shifts_rigid
 
         # Generate projections
-        images_corrected, (a, b) = model.phys_decoder(flow, x, model.coords, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type, model.sigma)
-        images_rigid, _ = model.phys_decoder(jnp.zeros_like(flow), x, model.coords, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type, model.sigma)
+        images_corrected, (a, b) = model.phys_decoder(flow, x, model.coords, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type, model.sigma.get_value())
 
         # Losses
         images_corrected = jnp.squeeze(images_corrected)
-        images_rigid = jnp.squeeze(images_rigid)
         x = jnp.squeeze(x)
 
         # Consider CTF if Wiener or Squared mode (only for loss)
         if model.ctf_type == "wiener":
             x_loss = wiener2DFilter(x, ctf, pad_factor=2)
             images_corrected_loss = wiener2DFilter(images_corrected, ctf, pad_factor=2)
-            images_rigid_loss = wiener2DFilter(images_rigid, ctf, pad_factor=2)
         elif model.ctf_type == "squared":
             x_loss = ctfFilter(x, ctf, pad_factor=2)
             images_corrected_loss = ctfFilter(images_corrected, ctf, pad_factor=2)
-            images_rigid_loss = ctfFilter(images_rigid, ctf, pad_factor=2)
         else:
             x_loss = x
             images_corrected_loss = images_corrected
-            images_rigid_loss = images_rigid
 
         # Adjusted image
         # images_corrected_loss = a * images_corrected_loss + b
 
         recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
-        recon_loss_rigid = mse(images_rigid_loss[..., None], x_loss[..., None]).mean()
-        # recon_loss = correlation_coefficient_loss(images_corrected_loss, x_loss).mean()
-        # recon_loss_rigid = correlation_coefficient_loss(images_rigid_loss, x_loss).mean()
-        recons_loss_all = 0.5 * (recon_loss + recon_loss_rigid)
-
-        # Field norm loss
-        # field_norm_loss = jnp.sqrt(jnp.square(flow).sum(axis=-1)).mean() / model.xsize
+        recons_loss_all = recon_loss
 
         if model.isVae:
             # KL divergence loss
-            kl_loss = -0.5 * jnp.sum(1 + 2 * logstd - jnp.square(jnp.exp(logstd)) - jnp.square(latent))
+            kl_loss = -0.5 * jnp.sum(1. + 2. * logstd - jnp.square(jnp.exp(logstd)) - jnp.square(latent))
         else:
             kl_loss = 0.0
 
@@ -628,13 +621,27 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
         loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, tau)
         loss_graph = (loss_def_regularity + 0.01 * loss_repulsion).mean()
 
+        # Centering loss
+        cm = jnp.average(deformed_positions, weights=jnp.broadcast_to(model.values[None, ..., None], deformed_positions.shape), axis=1)
+        loss_cm = jnp.linalg.norm(cm, axis=1).mean()
+
+        # Local distance preservation
+        if model.isVae:
+            flow_mean, _ = model.flow_decoder(latent, model.coords, model.xsize)
+            deformed_positions_mean = model.coords + flow_mean / (0.5 * model.xsize)
+            loss_dp = jnp.abs(model.values[None, ..., None] * deformed_positions
+                              - model.values[None, ..., None] * deformed_positions_mean).mean()
+        else:
+            loss_dp = 0.0
+
         # Decoupling
         if model.decoupling or model.isTomo:
             if not model.isTomo:
                 rotations_random_matrix = euler_matrix_batch(rotations_random[:, 0], rotations_random[:, 1], rotations_random[:, 2])
+                rotations_random_refined = jnp.matmul(rotations_random_matrix, jax.lax.stop_gradient(rotations_rigid))
                 shifts_random_refined = jnp.zeros_like(shifts_refined)
-                images_random, _ = model.phys_decoder(flow, x, model.coords, model.values, model.xsize, rotations_random_matrix,
-                                                      shifts_random_refined, ctf_random, model.ctf_type, model.sigma)
+                images_random, _ = model.phys_decoder(flow, x, model.coords, model.values, model.xsize, rotations_random_refined,
+                                                      shifts_random_refined, ctf_random, model.ctf_type, model.sigma.get_value())
                 if model.isVae:
                     (_, latent_1, _), prev_layer_out_random = model.encoder(images_corrected[..., None], "encoder_dec",
                                                                            return_last=True, return_alignment_refinement=False, rngs=distributions_key)
@@ -664,7 +671,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
         else:
             decoupling_loss = 0.0
 
-        loss = recons_loss_all + 0.000001 * kl_loss + 0.000001 * decoupling_loss + 0.9 * loss_graph
+        loss = recons_loss_all + 0.000001 * kl_loss + 0.0001 * decoupling_loss + 10. * loss_graph + 0.01 * loss_dp + 0.01 * loss_cm
         return loss, (recon_loss, latent)
 
     # Check if Tomo mode
@@ -772,10 +779,10 @@ def validation_step_zernike3deep(graphdef, state, x, labels, md, key):
 
         # Consider refinement and rigid registration alignments (for flow_decoder_rigid output)
         rotations_refined = jnp.matmul(rotations, rotations_rigid)
-        shifts_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
+        shifts_refined = shifts + (0.5 * model.xsize) * shifts_rigid
 
         # Generate projections
-        images_corrected, (a, b) = model.phys_decoder(flow, x, model.coords, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+        images_corrected, (a, b) = model.phys_decoder(flow, x, model.coords, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type, model.sigma.get_value())
 
         # Losses
         images_corrected = jnp.squeeze(images_corrected)
@@ -789,7 +796,7 @@ def validation_step_zernike3deep(graphdef, state, x, labels, md, key):
             x_loss = ctfFilter(x, ctf, pad_factor=2)
             images_corrected_loss = ctfFilter(images_corrected, ctf, pad_factor=2)
         else:
-            x_loss = a * x + b
+            x_loss = x
             images_corrected_loss = images_corrected
 
         recon_loss = dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
@@ -879,10 +886,10 @@ def main():
                              f"{bcolors.BOLD}send_to_pickle{bcolors.ENDC}: save the network in pickle format. ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case - "
                              f"needed by program {bcolors.UNDERLINE}estimate_latent_covariances{bcolors.ENDC})")
     parser.add_argument("--num_gaussians", required=False, type=int,
-                        help="Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. "
+                        help="Before training the network, Zernike3Deep will try to fit a set of Gaussians in the reference volume to recreate it. "
                              "The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume "
                              "with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., "
-                             "the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians "
+                             "the number of residues in your protein), you can set this parameter. When set, the Zernike3Deep will fit this fixed number of Gaussians "
                              "so that the reproduce the reference volume as well as possible.")
     parser.add_argument("--epochs", required=False, type=int, default=50,
                         help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - "
@@ -908,6 +915,9 @@ def main():
                         help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - "
                              f"{bcolors.WARNING}NOTE{bcolors.ENDC}: Since Zernike3Deep also learns a gray level adjustment, reload must be the path to a folder containing two additional "
                              f"folders called: {bcolors.UNDERLINE}Zernike3Deep{bcolors.ENDC} and {bcolors.UNDERLINE}Gaussian_volume_fitting{bcolors.ENDC})")
+    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
+                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
+                             f"the default disk.")
     args, _ = parser.parse_known_args()
 
     # Check that training and validation fractions add up to one
@@ -936,6 +946,8 @@ def main():
         mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
         generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
                                              precision=np.float16, group_size=1, shard_size=10000)
+    else:
+        mmap_output_dir = None
 
     # Check if Tomo is needed
     isTomo = generator.mode == "tomo"
@@ -962,15 +974,6 @@ def main():
                                                                             load_to_ram=args.load_images_to_ram)
         steps_per_epoch = int(int(args.dataset_split_fraction[0] * len(generator.md)) / args.batch_size)
         steps_per_val = int(int(args.dataset_split_fraction[1] * len(generator.md)) / args.batch_size)
-
-        # Example of training data for Tensorboard
-        with closing(iter(data_loader_train)) as iter_data_loader:
-            if zernike3deep.isTomo:
-                (x_example, _), labels_example = next(iter_data_loader)
-            else:
-                x_example, labels_example = next(iter_data_loader)
-        x_example = jax.vmap(min_max_scale)(x_example)
-        writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
         # Projector help text in Tensorboard
         legend_projector = """
@@ -1012,7 +1015,8 @@ def main():
                 vol = np.array(model(place_deltas=True))
 
             # Prepare network (Zernike3Deep)
-            coords = np.array(model.means.get_value())
+            factor = 0.5 * vol.shape[0]
+            coords = np.array(factor * model.means.get_value() + factor)
             coords = np.stack([coords[..., 2], coords[..., 1], coords[..., 0]], axis=1)
             values = np.array(jax.nn.relu(model.weights.get_value()))
             sigma = jax.nn.relu(model.sigma_param.get_value())
@@ -1022,6 +1026,15 @@ def main():
                                         rngs=nnx.Rngs(model_key))
 
         zernike3deep.train()
+
+        # Example of training data for Tensorboard
+        with closing(iter(data_loader_train)) as iter_data_loader:
+            if zernike3deep.isTomo:
+                (x_example, _), labels_example = next(iter_data_loader)
+            else:
+                x_example, labels_example = next(iter_data_loader)
+        x_example = jax.vmap(min_max_scale)(x_example)
+        writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
         # Learning rate scheduler
         # total_steps = args.epochs * steps_per_epoch
@@ -1037,7 +1050,7 @@ def main():
 
         # Resume if checkpoint exists
         if os.path.isdir(os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT")):
-            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"),
+            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT"),
                                                                                         optimizer, optimizer_grays)
             print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
         else:
@@ -1098,20 +1111,20 @@ def main():
                     writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
 
                     # Decode some states and show them in Tensorboard
-                    volumes_intermediate = zernike3deep_decode_volume(latents_intermediate)
+                    volumes_intermediate = zernike3deep_decode_volume(graphdef, state, latents_intermediate)
                     writer.add_volumes_slices(volumes_intermediate)
 
                     # Log landscape stored in memory bank
                     if i > 0 and i % 5 == 0:
                         choice_key_use, choice_key = jax.random.split(choice_key, 2)
-                        hetsiren_intermediate, _ = nnx.merge(graphdef, state)
+                        zernike3deep_intermediate, _, _ = nnx.merge(graphdef, state)
                         random_indices = jnr.choice(choice_key_use,
-                                                    a=jnp.arange(hetsiren_intermediate.bank_size),
-                                                    shape=(hetsiren_intermediate.subset_size,), replace=False)
-                        latents_intermediate = hetsiren_intermediate.memory_bank.get_value()[random_indices]
-                        latents_data_loader = NumpyGenerator(latents_intermediate).return_tf_dataset(preShuffle=False,
-                                                                                                     shuffle=False,
-                                                                                                     batch_size=args.batch_size)
+                                                    a=jnp.arange(zernike3deep_intermediate.bank_size),
+                                                    shape=(zernike3deep_intermediate.subset_size,), replace=False)
+                        latents_intermediate = zernike3deep_intermediate.memory_bank.get_value()[random_indices]
+                        latents_data_loader = NumpyGenerator(latents_intermediate).return_grain_dataset(
+                            preShuffle=False, shuffle=False, batch_size=args.batch_size,
+                            num_epochs=1, num_workers=0)
                         latents_images = []
                         for (latents, _) in latents_data_loader:
                             random_labels = jnp.asarray(
@@ -1135,6 +1148,8 @@ def main():
                         # Save checkpoint model
                         NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT"),  epoch=i)
 
+                    i += 1
+
                 loss, recon_loss, state, rng = train_step_zernike3deep(graphdef, state, x, labels, md_columns, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss
@@ -1155,7 +1170,7 @@ def main():
                                        i * steps_per_epoch + step)
 
                 # Summary writer (validation loss)
-                if step % int(np.ceil(0.5 * steps_per_epoch)) == 0:
+                if step % int(np.ceil(0.6 * steps_per_epoch)) == 0:
                     # Run validation step
                     pbar.set_postfix_str(f"{bcolors.WARNING}Running validation step...{bcolors.ENDC}")
                     for _ in range(steps_per_val):
@@ -1194,7 +1209,7 @@ def main():
 
         # Prepare data loader
         data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
-                                                     num_workers=0, load_to_ram=args.load_images_to_ram)
+                                                     num_workers=6, load_to_ram=args.load_images_to_ram)
         steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
         # Jitted prediction function
@@ -1203,68 +1218,57 @@ def main():
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting Zernike3Deep latents... ######")
 
-        pbar = tqdm(range(steps_per_epoch), desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green",
+        pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green", total=steps_per_epoch,
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
-        latents = []
-        euler_angles = []
-        shifts = []
-        with closing(iter(data_loader)) as iter_data_loader:
-            for _ in pbar:
-                (x, labels) = next(iter_data_loader)
+        md_pred = generator.md
+        md_pred[:, 'latent_space'] = np.asarray([",".join(np.char.mod('%f', item)) for item in np.zeros((len(md_pred), args.lat_dim))])
+        for (x, labels) in pbar:
+            # Wiener filter if precorrect CTF mode
+            if args.ctf_type == "precorrect":
+                defocusU = md_columns["ctfDefocusU"][labels]
+                defocusV = md_columns["ctfDefocusV"][labels]
+                defocusAngle = md_columns["ctfDefocusAngle"][labels]
+                cs = md_columns["ctfSphericalAberration"][labels]
+                kv = md_columns["ctfVoltage"][labels][0]
+                ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                                 args.sr, [2 * zernike3deep.xsize, int(2 * 0.5 * zernike3deep.xsize + 1)],
+                                 x.shape[0], True)
+                x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
-                # Wiener filter if precorrect CTF mode
-                if args.ctf_type == "precorrect":
-                    defocusU = md_columns["ctfDefocusU"][labels]
-                    defocusV = md_columns["ctfDefocusV"][labels]
-                    defocusAngle = md_columns["ctfDefocusAngle"][labels]
-                    cs = md_columns["ctfSphericalAberration"][labels]
-                    kv = md_columns["ctfVoltage"][labels][0]
-                    ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
-                                     args.sr, [2 * zernike3deep.xsize, int(2 * 0.5 * zernike3deep.xsize + 1)],
-                                     x.shape[0], True)
-                    x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+            latents_batch, (rotations_rigid, shifts_rigid) = predict_fn(x)
 
-                latents_batch, (rotations_rigid, shifts_rigid) = predict_fn(x)
+            # Precompute batch aligments
+            rotations_batch = md_columns["euler_angles"][labels]
 
-                # Precompute batch aligments
-                rotations_batch = md_columns["euler_angles"][labels]
+            # Precompute batch shifts
+            shifts_batch = md_columns["shifts"][labels]
 
-                # Precompute batch shifts
-                shifts_batch = md_columns["shifts"][labels]
+            # Get rotation matrices
+            if rotations_batch.ndim == 2:
+                rotations_batch = euler_matrix_batch(rotations_batch[:, 0], rotations_batch[:, 1],
+                                                     rotations_batch[:, 2])
 
-                # Get rotation matrices
-                if rotations_batch.ndim == 2:
-                    rotations_batch = euler_matrix_batch(rotations_batch[:, 0], rotations_batch[:, 1],
-                                                         rotations_batch[:, 2])
+            # Consider refinement and rigid registration alignments
+            rotations_refined = jnp.matmul(rotations_batch, rotations_rigid)
+            shifts_refined = shifts_batch + (0.5 * zernike3deep.xsize) * shifts_rigid
 
-                # Consider refinement and rigid registration alignments
-                rotations_refined = jnp.matmul(rotations_batch, rotations_rigid)
-                shifts_refined = shifts_batch + jnp.matmul(shifts_rigid[:, None, :],
-                                                           rearrange(rotations_batch, "b m n -> b n m"))[:, 0, :2]
+            # Convert rotation to Euler angles in Xmipp format
+            euler_angles_refined = xmippEulerFromMatrix(rotations_refined)
 
-                # Convert rotation to Euler angles in Xmipp format
-                euler_angles_refined = xmippEulerFromMatrix(rotations_refined)
+            # Convert to Numpy
+            euler_angles_refined, shifts_refined = np.array(euler_angles_refined), np.array(shifts_refined)
 
-                # Convert to Numpy
-                euler_angles_refined, shifts_refined = np.array(euler_angles_refined), np.array(shifts_refined)
-
-                latents.append(latents_batch)
-                euler_angles.append(euler_angles_refined)
-                shifts.append(shifts_refined)
-        latents = np.asarray(jnp.concatenate(latents, axis=0))
-        euler_angles = np.asarray(jnp.concatenate(euler_angles, axis=0))
-        shifts = np.asarray(jnp.concatenate(shifts, axis=0))
+            # Save to metadata
+            md_pred[labels, 'angleRot'] = euler_angles_refined[..., 0]
+            md_pred[labels, 'angleTilt'] = euler_angles_refined[..., 1]
+            md_pred[labels, 'anglePsi'] = euler_angles_refined[..., 2]
+            md_pred[labels, 'shiftX'] = shifts_refined[..., 0]
+            md_pred[labels, 'shiftY'] = shifts_refined[..., 1]
+            md_pred[labels, 'latent_space'] = np.asarray([",".join(np.char.mod('%f', item)) for item in latents_batch])
 
         # Save latents in metadata
-        md = generator.md
-        md[:, 'latent_space'] = np.asarray([",".join(np.char.mod('%f', item)) for item in latents])
-        md[:, 'angleRot'] = euler_angles[:, 0]
-        md[:, 'angleTilt'] = euler_angles[:, 1]
-        md[:, 'anglePsi'] = euler_angles[:, 2]
-        md[:, 'shiftX'] = shifts[:, 0]
-        md[:, 'shiftY'] = shifts[:, 1]
-        md.write(os.path.join(args.output_path, "predicted_latents" +  os.path.splitext(args.md)[1]))
+        md_pred.write(os.path.join(args.output_path, "predicted_latents" +  os.path.splitext(args.md)[1]))
 
     elif args.mode == "send_to_pickle":
 
@@ -1272,5 +1276,5 @@ def main():
         NeuralNetworkCheckpointer.save(zernike3deep, os.path.join(args.output_path, "Zernike3Deep"))
 
     # If exists, clean MMAP
-    if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
-        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))
+    # if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
+    #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))
