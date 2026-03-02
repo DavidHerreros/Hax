@@ -11,6 +11,7 @@ from einops import rearrange
 
 from hax.utils import *
 from hax.layers import *
+from hax.programs.gaussian_volume_fitting import FastVariableBlur3D
 
 
 def mse(a, b):
@@ -198,7 +199,7 @@ class MoDART(nnx.Module):
 
 
 @jax.jit
-def single_step_modart(graphdef, state, x, labels, md, fields_modart, values_modart, key):
+def single_step_modart(graphdef, state, x, labels, md, fields_modart, key):
     model, optimizer = nnx.merge(graphdef, state)
 
     # Random keys
@@ -291,39 +292,39 @@ def interpolate_image_field(graphdef, state, images, initial_inds_modart):
     model = nnx.merge(graphdef, state)
     map_coordinates_vmap = jax.vmap(map_coordinates, in_axes=(-1, None, None), out_axes=-1)
     factor = xsize / model.xsize
+    initial_scale = 0.5 * model.xsize
+    scale = 0.5 * xsize
 
     # Get coordinates and field
-    fields, values = model.decode_field(images)
+    images_resized = jax.image.resize(images, (images.shape[0], model.xsize, model.xsize, 1), method='bilinear')
+    fields, initial_coords = model.decode_field(images_resized)
     # fields_values = jnp.concatenate((fields, values[..., None]), axis=-1)
-    initial_inds = model.inds
+    initial_coords = jnp.round(initial_scale * initial_coords + initial_scale).astype(jnp.int32)
+    fields = scale * fields
     initial_inds_modart = initial_inds_modart / factor
 
     # Empty grids
-    grids = jnp.zeros((images.shape[0], images.shape[1], images.shape[1], images.shape[1], 3))
+    grids = jnp.zeros((images.shape[0], model.xsize, model.xsize, model.xsize, 3))
 
     # Place values on grid
     def place_on_single_grid(grid, inds, values):
-        grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 0].set(values[..., 0])
-        grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 1].set(values[..., 1])
-        grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 2].set(values[..., 2])
+        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 0].set(values[..., 0])
+        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 1].set(values[..., 1])
+        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 2].set(values[..., 2])
         # grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 0].set(values[..., 3])
         return grid
     place_on_grids = jax.vmap(place_on_single_grid, in_axes=(0, None, 0))
-    grids = place_on_grids(grids, initial_inds, fields)
+    grids = place_on_grids(grids, initial_coords, fields)
 
     # Low pass filter grids
-    fields_values_modart = []
+    gaussian_filter = FastVariableBlur3D((model.xsize, model.xsize, model.xsize))
+    grids = gaussian_filter(grids, sigma=1.0)
+    fields_modart = []
     for grid in grids:
-        grid_filtered = fast_gaussian_filter_3d(grid, sigma=1.0)
-        fields_values_modart.append(map_coordinates_vmap(grid_filtered, initial_inds_modart.T, 1))
-    fields_values_modart = jnp.stack(fields_values_modart, axis=0)
+        fields_modart.append(map_coordinates_vmap(grid, initial_inds_modart.T, 1))
+    fields_modart = jnp.stack(fields_modart, axis=0)
 
-    # Interpolate grids
-    # fields_modart = map_coordinates_vmap(grids_filtered, initial_inds_modart.T, 1)
-    fields_modart = factor * fields_values_modart
-    # fields_modart = jnp.stack([fields_modart[..., 2], fields_modart[..., 1], fields_modart[..., 0]], axis=-1)
-    # values_modart = fields_values_modart[..., 3]
-    return fields_modart, jnp.zeros_like(values)
+    return fields_modart
 
 
 def main():
@@ -386,7 +387,7 @@ def main():
     md_columns = extract_columns(generator.md)
 
     # Prepare grain dataset
-    if not args.load_images_to_ram and args.mode in ["train", "predict"]:
+    if not args.load_images_to_ram:
         mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
         generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
                                              precision=np.float16, group_size=1, shard_size=10000)
@@ -462,51 +463,63 @@ def main():
         writer.add_images("Example of data batch", x_example, dataformats="NHWC")
 
     if args.vol is not None:
-        # Optimizers (Volume Adjustment)
-        optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5), wrt=nnx.Param)
-        graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
+        checkpoint_volume_adjustment = os.path.join(args.output_path, "VolumeAdjustment")
+        if not os.path.isdir(checkpoint_volume_adjustment):
+            # Optimizers (Volume Adjustment)
+            optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5), wrt=nnx.Param)
+            graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
 
-        # Number epochs (volume adjustment)
-        if len(generator.md) >= 10000:
-            num_epochs_vol = 20
-        else:
-            num_epochs_vol = 200
+            # Number epochs (volume adjustment)
+            if len(generator.md) >= 1000000:
+                num_epochs_vol = 5
+            else:
+                num_epochs_vol = 20
 
-        # Training loop (Volume Adjustment)
-        print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
+            data_loader_vol = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global", num_epochs=None,
+                                                             num_workers=-1, num_threads=1, split_fraction=None,
+                                                             load_to_ram=args.load_images_to_ram)
 
-        i = 0
-        pbar = tqdm(range(steps_per_epoch, args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=",
-                    colour="green",
-                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+            # Training loop (Volume Adjustment)
+            print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
 
-        with closing(iter(data_loader)) as iter_data_loader:
-            for total_steps in pbar:
-                (x, labels) = next(iter_data_loader)
+            i = 0
+            pbar = tqdm(range(num_epochs_vol * steps_per_epoch), file=sys.stdout, ascii=" >=",
+                        colour="green",
+                        bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
-                if total_steps % steps_per_epoch == 0:
-                    total_loss = 0
+            with closing(iter(data_loader_vol)) as iter_data_loader_vol:
+                for total_steps in pbar:
+                    (x, labels) = next(iter_data_loader_vol)
 
-                    # For progress bar (TQDM)
-                    step = 1
-                    pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
+                    if total_steps % steps_per_epoch == 0:
+                        total_loss = 0
 
-                loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
-                                                           args.ctf_type, vol.shape[0])
-                total_loss += loss
+                        # For progress bar (TQDM)
+                        step = 1
+                        pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{num_epochs_vol}")
 
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+                    i += 1
 
-                # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
-                    writer.add_scalar('Training loss (volume adjustment)',
-                                      total_loss / step,
-                                      i * len(data_loader) + step)
+                    loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
+                                                               args.ctf_type, vol.shape[0])
+                    total_loss += loss
+
+                    # Progress bar update  (TQDM)
+                    pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+
+                    # Summary writer (training loss)
+                    if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
+                        writer.add_scalar('Training loss (volume adjustment)',
+                                          total_loss / step,
+                                          i * steps_per_epoch + step)
 
                     step += 1
 
-        volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
+            volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
+            NeuralNetworkCheckpointer.save(volumeAdjustment, checkpoint_volume_adjustment)
+        else:
+            volumeAdjustment = NeuralNetworkCheckpointer.load(checkpoint_path=checkpoint_volume_adjustment)
+
         values = volumeAdjustment()
 
         # Place values on grid and replace MoDART reference volume
@@ -516,7 +529,7 @@ def main():
         modart.delta_volume_decoder.reference_values = values
 
     # Learning rate scheduler
-    total_steps_per_epoch =  len(data_loader) if not args.reconstruct_halves else len(data_loader_even)
+    total_steps_per_epoch =  steps_per_epoch if not args.reconstruct_halves else steps_per_epoch_even
     total_steps = 20 * total_steps_per_epoch
     lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=1e-3, total_steps=total_steps, warmup_frac=0.1, init_value=0.0, end_value=0.0)
 
@@ -552,7 +565,7 @@ def main():
                 # For progress bar (TQDM)
                 step = 1
                 pbar.reset()
-                pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
+                pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}")
 
                 # Intermediate volume
                 modart_volume = get_modart_volume(graphdef, state)
@@ -596,13 +609,12 @@ def main():
 
                 if args.motion_correction is not None:
                     x_interpolation = jnp.reshape(x, (-1, x.shape[2], x.shape[3], 1))
-                    field_modart, values_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x_interpolation, modart.inds)
-                    field_modart = np.reshape(x, (x.shape[0], x.shape[1], field_modart.shape[1], field_modart.shape[2]))
+                    field_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x_interpolation, modart.inds)
+                    field_modart = jnp.reshape(x, (x.shape[0], x.shape[1], field_modart.shape[1], field_modart.shape[2]))
                 else:
-                    field_modart = np.zeros((x.shape[0], modart.inds.shape[0], 4))[:, None, ...]
-                    values_modart = np.zeros((x.shape[0], modart.inds.shape[0]))[:, None, ...]
+                    field_modart = jnp.zeros((x.shape[0], modart.inds.shape[0], 3))[:, None, ...]
 
-                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, values_modart, rng)
+                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
@@ -630,17 +642,15 @@ def main():
             else:
                 (x, labels) = next(iter_data_loader)
                 if args.motion_correction is not None:
-                    field_modart, values_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x, modart.inds)
+                    field_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x, modart.inds)
                 else:
-                    field_modart = np.zeros((x.shape[0], modart.inds.shape[0], 4))
-                    values_modart = np.zeros((x.shape[0], modart.inds.shape[0]))
+                    field_modart = jnp.zeros((x.shape[0], modart.inds.shape[0], 3))
 
                 x = x[:, None, ...]
                 labels = labels[:, None, ...]
                 field_modart = field_modart[:, None, ...]
-                values_modart = values_modart[:, None, ...]
 
-                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, values_modart, rng)
+                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss[0]
 
@@ -678,5 +688,5 @@ def main():
         ImageHandler().write(np.array(modart_volume), os.path.join(args.output_path, "modart_map.mrc"), overwrite=True)
 
     # If exists, clean MMAP
-    if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
-        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))
+    # if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
+    #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))
