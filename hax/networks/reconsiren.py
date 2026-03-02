@@ -717,7 +717,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         loss_uniform = uniform_angular_distribution_loss #+ diversity_loss
 
         loss = (recon_loss_all + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + 0.000001 * kl_loss +
-                0.001 * loss_uniform)
+                0.0005 * loss_uniform)
         # loss = (recon_loss_all + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + 0.0001 * kl_loss +
         #         0.01 * uniform_angular_distribution_loss + 0.01 * diversity_loss)
         return loss, (recon_loss, loss_uniform, euler_angles)
@@ -1408,7 +1408,7 @@ def main():
 
         # Prepare data loader
         data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
-                                                     num_workers=0, load_to_ram=args.load_images_to_ram)
+                                                     num_workers=6, load_to_ram=args.load_images_to_ram)
         steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
         # Jitted functions for volume prediction
@@ -1419,32 +1419,30 @@ def main():
         print(f"{bcolors.OKCYAN}\n###### Predicting angular assignment / shifts... ######")
 
         # For progress bar (TQDM)
-        pbar = tqdm(range(steps_per_epoch), file=sys.stdout, ascii=" >=", colour="green",
+        pbar = tqdm(data_loader, file=sys.stdout, ascii=" >=", colour="green", total=steps_per_epoch,
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
         graphdef, state = nnx.split(reconsiren)
         md_pred = generator.md
         latents = []
-        with closing(iter(data_loader)) as iter_data_loader:
-            for _ in pbar:
-                (x, labels) = next(iter_data_loader)
-                rotations, shifts, latent = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_columns, rng)
+        for (x, labels) in pbar:
+            rotations, shifts, latent = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_columns, rng)
 
-                # Convert rotation to Euler angles in Xmipp format
-                euler_angles = xmippEulerFromMatrix(rotations)
+            # Convert rotation to Euler angles in Xmipp format
+            euler_angles = xmippEulerFromMatrix(rotations)
 
-                # Convert to Numpy
-                euler_angles, shifts = np.array(euler_angles), np.array(shifts)
+            # Convert to Numpy
+            euler_angles, shifts = np.array(euler_angles), np.array(shifts)
 
-                # Store in metadata
-                md_pred[labels, 'angleRot'] = euler_angles[:, 0]
-                md_pred[labels, 'angleTilt'] = euler_angles[:, 1]
-                md_pred[labels, 'anglePsi'] = euler_angles[:, 2]
-                md_pred[labels, 'shiftX'] = shifts[:, 0]
-                md_pred[labels, 'shiftY'] = shifts[:, 1]
+            # Store in metadata
+            md_pred[labels, 'angleRot'] = euler_angles[:, 0]
+            md_pred[labels, 'angleTilt'] = euler_angles[:, 1]
+            md_pred[labels, 'anglePsi'] = euler_angles[:, 2]
+            md_pred[labels, 'shiftX'] = shifts[:, 0]
+            md_pred[labels, 'shiftY'] = shifts[:, 1]
 
-                # Save latents to list
-                latents.append(latent)
+            # Save latents to list
+            latents.append(latent)
 
         # Save latents to metadata
         latents = np.concatenate(latents, axis=0)
