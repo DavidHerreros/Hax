@@ -550,7 +550,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
         if model.isVae:
             if model.decoupling:
                 (sample, latent, logstd), (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
-            elif model.isTomoSIREN:
+            elif model.isTomo:
                 (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
                 (_, latent_1, _), (rotations_rigid, shifts_rigid), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
             else:
@@ -558,7 +558,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
         else:
             if model.decoupling:
                 latent, (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
-            elif model.isTomoSIREN:
+            elif model.isTomo:
                 latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
                 latent_1, (rotations_rigid, shifts_rigid), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
             else:
@@ -578,7 +578,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
 
         # Refine angular alignment
         rotations_refined = jnp.matmul(rotations, rotations_rigid)
-        shifts_refined = shifts + (0.5 * model.xsize) * shifts_rigid
+        shifts_refined = shifts + shifts_rigid
 
         # Generate projections
         images_corrected, (a, b) = model.phys_decoder(flow, x, model.coords, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type, model.sigma.get_value())
@@ -753,14 +753,14 @@ def validation_step_zernike3deep(graphdef, state, x, labels, md, key):
         if model.isVae:
             if model.decoupling:
                 (sample, latent, logstd), (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
-            elif model.isTomoSIREN:
+            elif model.isTomo:
                 (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True, rngs=distributions_key)
             else:
                 (sample, latent, logstd), (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True, rngs=distributions_key)
         else:
             if model.decoupling:
                 latent, (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
-            elif model.isTomoSIREN:
+            elif model.isTomo:
                 latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True, rngs=distributions_key)
             else:
                 latent, (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True, rngs=distributions_key)
@@ -779,7 +779,7 @@ def validation_step_zernike3deep(graphdef, state, x, labels, md, key):
 
         # Consider refinement and rigid registration alignments (for flow_decoder_rigid output)
         rotations_refined = jnp.matmul(rotations, rotations_rigid)
-        shifts_refined = shifts + (0.5 * model.xsize) * shifts_rigid
+        shifts_refined = shifts + shifts_rigid
 
         # Generate projections
         images_corrected, (a, b) = model.phys_decoder(flow, x, model.coords, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type, model.sigma.get_value())
@@ -1251,7 +1251,7 @@ def main():
 
             # Consider refinement and rigid registration alignments
             rotations_refined = jnp.matmul(rotations_batch, rotations_rigid)
-            shifts_refined = shifts_batch + (0.5 * zernike3deep.xsize) * shifts_rigid
+            shifts_refined = shifts_batch + shifts_rigid
 
             # Convert rotation to Euler angles in Xmipp format
             euler_angles_refined = xmippEulerFromMatrix(rotations_refined)

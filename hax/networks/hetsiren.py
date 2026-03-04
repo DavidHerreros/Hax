@@ -756,7 +756,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         else:
             # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
             rotations_refined = jnp.matmul(rotations, rotations_rigid)
-        shifts_refined = shifts + model.delta_volume_decoder.scale * shifts_rigid
+        shifts_refined = shifts + shifts_rigid
 
         # Only rigid part: coords and values
         reference_values = model.delta_volume_decoder.reference_values
@@ -1057,7 +1057,7 @@ def gradient_for_recon_graph_losses(graphdef, state, x, labels, md, key):
             rotations = euler_angles
 
         rotations_refined = jnp.matmul(rotations, rotations_rigid)
-        shifts_refined = shifts + model.delta_volume_decoder.scale * shifts_rigid
+        shifts_refined = shifts + shifts_rigid
 
         # Reference values
         reference_values = model.delta_volume_decoder.reference_values
@@ -1232,8 +1232,7 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
 
         # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
         rotations_refined = jnp.matmul(rotations, rotations_rigid)
-        # shifts_refined = shifts + model.delta_volume_decoder.scale * jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations, "b m n -> b n m"))[:, 0, :2]
-        shifts_refined = shifts + model.delta_volume_decoder.scale * shifts_rigid
+        shifts_refined = shifts + shifts_rigid
 
         # Centering
         centering = model.delta_volume_decoder.centering
@@ -1769,7 +1768,7 @@ def main():
 
             # Consider refinement and rigid registration alignments
             rotations_refined = jnp.matmul(rotations_batch, rotations_rigid)
-            shifts_refined = shifts_batch + hetsiren.delta_volume_decoder.scale * shifts_rigid
+            shifts_refined = shifts_batch + shifts_rigid
 
             # Convert rotation to Euler angles in Xmipp format
             euler_angles_refined = xmippEulerFromMatrix(rotations_refined)
