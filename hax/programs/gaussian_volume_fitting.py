@@ -488,8 +488,8 @@ def training_step_local_adjustment(graphdef, state, target, projection_parameter
     return loss_val, state
 
 
-@partial(jax.jit, static_argnames=("grid_size",))
-def training_step_global_adjustment(graphdef, state, target, projection_parameters, means, weights, sigma, grid_size):
+@partial(jax.jit, static_argnames=("grid_size", "ctf_type"))
+def training_step_global_adjustment(graphdef, state, target, projection_parameters, means, weights, sigma, grid_size, ctf_type):
     model, optimizer = nnx.merge(graphdef, state)
 
     def loss_fn(model, target, means, weights, sigma):
@@ -520,6 +520,10 @@ def training_step_global_adjustment(graphdef, state, target, projection_paramete
             ctf = jnp.ones(
                 [rotations.shape[0], pad_factor * grid_size, int(pad_factor * 0.5 * grid_size + 1)],
                 dtype=means.dtype)
+
+        if ctf_type in ["wiener", "precorrect"]:
+            target = wiener2DFilter(jnp.squeeze(target), ctf)[..., None]
+            ctf = jnp.ones_like(ctf)
 
         recon_images = splat_weights_bilinear(grid_size, means, weights, sigma, rotations, shifts, ctf)
 
@@ -756,7 +760,7 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
     return model, k_history, loss_history
 
 
-def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256, learning_rate=0.01, num_epochs=3, is_global=False):
+def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256, learning_rate=0.01, num_epochs=3, is_global=False, ctf_type="apply"):
     # Prepare metadata
     generator = MetaDataGenerator(md_path)
     md_columns = extract_columns(generator.md)
@@ -807,7 +811,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
             # --- TRAIN STEP ---
             projection_parameters = {"euler_angles": md_columns["euler_angles"][labels],
                                      "shifts": md_columns["shifts"][labels]}
-            if "ctfDefocusU" in md_columns.keys():
+            if "ctfDefocusU" in md_columns.keys() and ctf_type in ["apply", "wiener", "squared", "precorrect"]:
                 ctf_parameters = {"ctfDefocusU": md_columns["ctfDefocusU"][labels],
                                   "ctfDefocusV": md_columns["ctfDefocusV"][labels],
                                   "ctfDefocusAngle": md_columns["ctfDefocusAngle"][labels],
@@ -818,7 +822,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
 
             if is_global:
                 loss_val, state = training_step_global_adjustment(graphdef, state, x[..., 0], projection_parameters,
-                                                                  means, weights, sigma, grid_size=grid_size)
+                                                                  means, weights, sigma, grid_size=grid_size, ctf_type=ctf_type)
             else:
                 loss_val, state = training_step_local_adjustment(graphdef, state, x[..., 0], projection_parameters)
 
