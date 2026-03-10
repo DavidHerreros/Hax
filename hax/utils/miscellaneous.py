@@ -574,3 +574,51 @@ def sample_mask_points(mask, N):
 
 def safe_norm(x, axis=-1, eps=1e-8):
     return jnp.sqrt(jnp.sum(jnp.square(x), axis=axis) + eps)
+
+
+def positional_encoding(coords: jax.Array, enc_dim: int, DD: int) -> jax.Array:
+    """Positional encoding of continuous coordinates.
+
+    Maps continuous input coordinates into a higher-dimensional space using
+    logarithmically spaced frequencies. This allows coordinate-based neural
+    networks to learn high-frequency details.
+
+    Parameters
+    ----------
+    coords: jax.Array
+        `(n, 3)` array of input coordinates.
+    enc_dim: int
+        The number of frequency bands to generate.
+    DD: int
+        A scaling factor (often related to the box size or domain diameter).
+
+    Returns
+    -------
+    jax.Array
+        The positionally encoded coordinates.
+    """
+    D2 = DD // 2
+
+    # freqs: shape (enc_dim,)
+    freqs = jnp.arange(enc_dim, dtype=jnp.float32)
+    freqs = D2 * (1. / D2) ** (freqs / (enc_dim - 1))
+
+    # Reshape freqs to broadcast with coords: e.g., (1, 1, enc_dim)
+    shape = (1,) * coords.ndim + (-1,)
+    freqs = jnp.reshape(freqs, shape)
+
+    # Expand coords: e.g., (n, 3, 1)
+    coords_expanded = jnp.expand_dims(coords, axis=-1)
+
+    # k: shape (n, 3, enc_dim)
+    k = coords_expanded * freqs
+
+    s = jnp.sin(k)
+    c = jnp.cos(k)
+
+    # Concatenate along the last axis: shape (n, 3, enc_dim * 2)
+    x = jnp.concatenate([s, c], axis=-1)
+
+    # Flatten the last two dimensions: shape (n, 3 * enc_dim * 2)
+    new_shape = x.shape[:-2] + (-1,)
+    return jnp.reshape(x, new_shape)
