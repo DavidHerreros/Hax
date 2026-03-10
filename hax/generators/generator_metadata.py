@@ -432,7 +432,7 @@ class MetaDataGenerator:
                 sources_train = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
                 dataset_train = grain.MapDataset.source(sources_train)
 
-        elif self.grain_dataset_type == "MMAP":
+        elif self.grain_dataset_type == "MMAP":  # TODO: Add labels to LazyNinjaGrainSource
             from mmap_ninja import numpy as np_ninja
 
             # Class to handle mmap_ninja shards
@@ -489,25 +489,27 @@ class MetaDataGenerator:
         elif self.grain_dataset_type == "RAM":
 
             images = self.load_images_to_ram(np.arange(len(self.md)))
+            labels = np.arange(len(self.md)).astype(int)
 
             class NumpyDataSource:
-                def __init__(self, data):
+                def __init__(self, data, labels):
                     self._data = data
+                    self._labels = labels
 
                 def __len__(self):
                     return len(self._data)
 
                 def __getitem__(self, idx):
-                    return self._data[idx], idx
+                    return self._data[idx], self._labels[idx]
 
             if split_fraction is not None:
                 split_point = int(split_fraction[0] * len(images))
-                sources_train = NumpyDataSource(images[split_point:])
-                sources_val = NumpyDataSource(images[:split_point])
+                sources_train = NumpyDataSource(images[split_point:], labels[split_point:])
+                sources_val = NumpyDataSource(images[:split_point], labels[:split_point])
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
-                sources_train = NumpyDataSource(images)
+                sources_train = NumpyDataSource(images, labels)
                 dataset_train = grain.MapDataset.source(sources_train)
 
         else:
