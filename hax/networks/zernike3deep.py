@@ -253,13 +253,13 @@ class FlowDecoder(nnx.Module):
         self.edge_weights = jnp.ones_like(self.edge_weights)
 
         # Coefficients layers
-        hidden_layers_coeff = [Linear(latent_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers_coeff = [Linear(latent_dim, 1024, rngs=rngs, dtype=jnp.bfloat16, use_bias=False)]
         for _ in range(3):
-            hidden_layers_coeff.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers_coeff.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16, use_bias=False))
         self.hidden_layers_coeff = nnx.List(hidden_layers_coeff)
-        self.latent_x = Linear(1024, len(self.zernike_degrees), rngs=rngs, kernel_init=jax.nn.initializers.normal(0.0001))
-        self.latent_y = Linear(1024, len(self.zernike_degrees), rngs=rngs, kernel_init=jax.nn.initializers.normal(0.0001))
-        self.latent_z = Linear(1024, len(self.zernike_degrees), rngs=rngs, kernel_init=jax.nn.initializers.normal(0.0001))
+        self.latent_x = Linear(1024, len(self.zernike_degrees), rngs=rngs, use_bias=False, kernel_init=jax.nn.initializers.normal(0.0001))
+        self.latent_y = Linear(1024, len(self.zernike_degrees), rngs=rngs, use_bias=False, kernel_init=jax.nn.initializers.normal(0.0001))
+        self.latent_z = Linear(1024, len(self.zernike_degrees), rngs=rngs, use_bias=False, kernel_init=jax.nn.initializers.normal(0.0001))
 
     def decode_coefficients(self, x):
         x = nnx.relu(self.hidden_layers_coeff[0](x))
@@ -838,6 +838,158 @@ def validation_step_zernike3deep(graphdef, state, x, labels, md, key):
     return loss
 
 
+@jax.jit
+def gradient_for_recon_graph_losses(graphdef, state, x, labels, md, key):
+    model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
+
+    distributions_key, key = jax.random.split(key, 2)
+
+    phys_decoder = model.phys_decoder
+    wiener2DFilter_vmap = wiener2DFilter
+    ctfFilter_vmap = ctfFilter
+
+    calculate_deformation_regularity_loss_batch = jax.vmap(calculate_deformation_regularity_loss, in_axes=(0, None, None, None))
+    calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None))
+
+    def predict_latent_from_images(model, x):
+        # Check if Tomo mode
+        if model.isTomo:
+            (x, subtomogram_label) = x
+
+        # Encode latent E(z)
+        if model.isVae:
+            if model.decoupling:
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True,
+                                                                                                          return_alignment_refinement=True, rngs=distributions_key)
+            elif model.isTomo:
+                (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+                (_, latent_1, _), (rotations_rigid, shifts_rigid), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True,
+                                                                                                         return_alignment_refinement=True, rngs=distributions_key)
+            else:
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True, rngs=distributions_key)
+        else:
+            if model.decoupling:
+                latent, (rotations_rigid, shifts_rigid), prev_layer_out = model.encoder(x, "encoder_exp", return_last=True,
+                                                                                        return_alignment_refinement=True, rngs=distributions_key)
+            elif model.isTomo:
+                latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
+                latent_1, (rotations_rigid, shifts_rigid), prev_layer_out_random = model.encoder(x, "encoder_exp", return_last=True,
+                                                                                                 return_alignment_refinement=True, rngs=distributions_key)
+            else:
+                latent, (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True, rngs=distributions_key)
+
+        return latent, rotations_rigid, shifts_rigid
+
+
+    def loss_representation_fn(model, x, latent, rotations_rigid, shifts_rigid):
+        # Decode flow field
+        flow, _ = model.flow_decoder(latent, model.coords, model.xsize)
+
+        # Get rotation matrices
+        if euler_angles.ndim == 2:
+            rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
+        else:
+            rotations = euler_angles
+
+        # Refine angular alignment
+        rotations_refined = jnp.matmul(rotations, rotations_rigid)
+        shifts_refined = shifts + shifts_rigid
+
+        # Generate projections
+        images_corrected, (a, b) = model.phys_decoder(flow, x, model.coords, model.values, model.xsize,
+                                                      rotations_refined, shifts_refined, ctf, model.ctf_type,
+                                                      model.sigma.get_value())
+
+        # Losses
+        images_corrected = jnp.squeeze(images_corrected)
+        x = jnp.squeeze(x)
+
+        # Consider CTF if Wiener mode (only for loss)
+        if model.ctf_type == "wiener":
+            x_loss = wiener2DFilter(x, ctf, pad_factor=2)
+            images_corrected_loss = wiener2DFilter_vmap(images_corrected, ctf, 2)
+        elif model.ctf_type == "squared":
+            x_loss = ctfFilter(x, ctf, pad_factor=2)
+            images_corrected_loss = ctfFilter_vmap(images_corrected, ctf, 2)
+        else:
+            x_loss = x
+            images_corrected_loss = images_corrected
+
+        recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None])
+
+        return recon_loss.mean()
+
+    def loss_graph_fn(model, latent):
+        # Decode flow field
+        flow, _ = model.flow_decoder(latent, model.coords, model.xsize)
+
+        # Graph based loss
+        consensus_distances = model.flow_decoder.consensus_distances
+        deformed_positions = model.coords + flow / (0.5 * model.xsize)
+        radius_graph = model.flow_decoder.edge_index
+        edge_weights = model.flow_decoder.edge_weights
+        tau = model.flow_decoder.tau
+        loss_def_regularity = calculate_deformation_regularity_loss_batch(deformed_positions, radius_graph,
+                                                                          consensus_distances, edge_weights)
+        loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, tau)
+        loss_graph = (loss_def_regularity + 0.01 * loss_repulsion).mean()
+
+        return loss_graph
+
+    # Check if Tomo mode
+    if model.isTomo:
+        (x, subtomogram_label) = x
+
+    # Precompute batch aligments
+    euler_angles = md["euler_angles"][labels]
+
+    # Precompute batch shifts
+    shifts = md["shifts"][labels]
+
+    # Precompute batch CTFs
+    if model.ctf_type is not None:
+        defocusU = md["ctfDefocusU"][labels]
+        defocusV = md["ctfDefocusV"][labels]
+        defocusAngle = md["ctfDefocusAngle"][labels]
+        cs = md["ctfSphericalAberration"][labels]
+        kv = md["ctfVoltage"][labels][0]
+        ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                         model.sr, [2 * model.xsize, int(2. * 0.5 * model.xsize + 1)],
+                         x.shape[0], True)
+    else:
+        ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2. * 0.5 * model.xsize + 1)], dtype=x.dtype)
+
+    if model.ctf_type == "precorrect":
+        # Wiener filter
+        x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+
+    # Get latent vectors and alignments
+    latent, rotations_rigid, shifts_rigid = predict_latent_from_images(model, x)
+    latent = jax.lax.stop_gradient(latent)
+    rotations_rigid = jax.lax.stop_gradient(rotations_rigid)
+    shifts_rigid = jax.lax.stop_gradient(shifts_rigid)
+    x = jax.lax.stop_gradient(x)
+
+    grads_data = nnx.grad(loss_representation_fn)(model, x, latent, rotations_rigid, shifts_rigid)
+    grads_reg = nnx.grad(loss_graph_fn)(model, latent)
+
+    params_filter = nnx.All(nnx.Param, nnx.PathContains('flow_decoder'))
+    grads_data, _ = grads_data.split(params_filter, ...)
+    grads_reg, _ = grads_reg.split(params_filter, ...)
+
+    # Calculate Global Norms
+    def global_norm(g):
+        leaves = jax.tree_util.tree_leaves(g)
+        return jnp.sqrt(sum(jnp.sum(jnp.square(l)) for l in leaves))
+
+    # norm_data = optax.global_norm(grads_data)
+    # norm_reg = optax.global_norm(grads_reg)
+    norm_data = global_norm(grads_data)
+    norm_reg = global_norm(grads_reg)
+
+    return norm_data, norm_reg
+
+
 def main():
     import os
     import sys
@@ -968,7 +1120,7 @@ def main():
 
         # Prepare data loader
         data_loader_train, data_loader_val = generator.return_grain_dataset(batch_size=args.batch_size,
-                                                                            shuffle="global", num_epochs=None,
+                                                                            shuffle="global_data_loader", num_epochs=None,
                                                                             num_workers=-1, num_threads=1,
                                                                             split_fraction=args.dataset_split_fraction,
                                                                             load_to_ram=args.load_images_to_ram)
@@ -1000,7 +1152,7 @@ def main():
 
                 # Adjust to images
                 model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                                    num_epochs=3, is_global=True)
+                                                    num_epochs=3, is_global=True, ctf_type=args.ctf_type)
 
                 # Save model
                 NeuralNetworkCheckpointer.save(model, fit_path)
@@ -1028,11 +1180,10 @@ def main():
         zernike3deep.train()
 
         # Example of training data for Tensorboard
-        with closing(iter(data_loader_train)) as iter_data_loader:
-            if zernike3deep.isTomo:
-                (x_example, _), labels_example = next(iter_data_loader)
-            else:
-                x_example, labels_example = next(iter_data_loader)
+        if zernike3deep.isTomo:
+            (x_example, _), labels_example = next(iter(data_loader_train))
+        else:
+            x_example, labels_example = next(iter(data_loader_train))
         x_example = jax.vmap(min_max_scale)(x_example)
         writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
@@ -1079,112 +1230,128 @@ def main():
                     colour="green",
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
-        with closing(iter(data_loader_train)) as iter_data_loader_train, closing(iter(data_loader_val)) as iter_data_loader_val:
-            for total_steps in pbar:
-                (x, labels) = next(iter_data_loader_train)
+        iter_data_loader_train = iter(data_loader_train)
+        for total_steps in pbar:
+            (x, labels) = next(iter_data_loader_train)
 
-                if total_steps % steps_per_epoch == 0:
-                    total_loss = 0
-                    total_recon_loss = 0
-                    total_validation_loss = 0
+            if total_steps % steps_per_epoch == 0:
+                total_loss = 0
+                total_recon_loss = 0
+                total_validation_loss = 0
 
-                    # For progress bar (TQDM)
-                    step = 1
-                    step_validation = 1
-                    pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
+                # Compute graph lambda
+                # graph_lambda = 0.9
+                num_warmup_epochs = 3
+                if i < num_warmup_epochs:
+                    graph_lambda = 1.0
+                else:
+                    pbar.set_description(f"{bcolors.WARNING}Computing graph loss lambda{bcolors.ENDC}")
+                    grad_norm_data, grad_norm_reg = 0.0, 0.0
+                    for _ in range(int(0.1 * steps_per_epoch)):
+                        (x_graph, labels_graph) = next(iter_data_loader_train)
+                        grad_norm_data_step, grad_norm_reg_step = gradient_for_recon_graph_losses(graphdef, state, x_graph, labels_graph, md_columns, rng)
+                        grad_norm_data += np.array(grad_norm_data_step)
+                        grad_norm_reg += np.array(grad_norm_reg_step)
+                        pbar.set_postfix_str(f"graph_lambda={0.9 * (grad_norm_data / grad_norm_reg):.5f}")
+                    graph_lambda = 0.9 * (grad_norm_data / grad_norm_reg)
 
-                    # Log intermediate results at the end of the epoch
-                    # Get first 5 images from batch
-                    if zernike3deep.isTomo:
-                        x_for_tb = x[0][:5]
-                    else:
-                        x_for_tb = x[:5]
-                    labels_for_tb = labels[:5]
+                # For progress bar (TQDM)
+                step = 1
+                step_validation = 1
+                pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
-                    # Decode some images and show them in Tensorboard
-                    x_pred_intermediate, latents_intermediate = zernike3deep_decode_image(graphdef, state, x_for_tb,
-                                                                                          labels_for_tb, md_columns,
-                                                                                          ctf_type=args.ctf_type,
-                                                                                          return_latent=True,
-                                                                                          corrupt_projection_with_ctf=True)
-                    x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
-                    writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
+                # Log intermediate results at the end of the epoch
+                # Get first 5 images from batch
+                if zernike3deep.isTomo:
+                    x_for_tb = x[0][:5]
+                else:
+                    x_for_tb = x[:5]
+                labels_for_tb = labels[:5]
 
-                    # Decode some states and show them in Tensorboard
-                    volumes_intermediate = zernike3deep_decode_volume(graphdef, state, latents_intermediate)
-                    writer.add_volumes_slices(volumes_intermediate)
+                # Decode some images and show them in Tensorboard
+                x_pred_intermediate, latents_intermediate = zernike3deep_decode_image(graphdef, state, x_for_tb,
+                                                                                      labels_for_tb, md_columns,
+                                                                                      ctf_type=args.ctf_type,
+                                                                                      return_latent=True,
+                                                                                      corrupt_projection_with_ctf=True)
+                x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
+                writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
 
-                    # Log landscape stored in memory bank
-                    if i > 0 and i % 5 == 0:
-                        choice_key_use, choice_key = jax.random.split(choice_key, 2)
-                        zernike3deep_intermediate, _, _ = nnx.merge(graphdef, state)
-                        random_indices = jnr.choice(choice_key_use,
-                                                    a=jnp.arange(zernike3deep_intermediate.bank_size),
-                                                    shape=(zernike3deep_intermediate.subset_size,), replace=False)
-                        latents_intermediate = zernike3deep_intermediate.memory_bank.get_value()[random_indices]
-                        latents_data_loader = NumpyGenerator(latents_intermediate).return_grain_dataset(
-                            preShuffle=False, shuffle=False, batch_size=args.batch_size,
-                            num_epochs=1, num_workers=0)
-                        latents_images = []
-                        for (latents, _) in latents_data_loader:
-                            random_labels = jnp.asarray(
-                                np.random.randint(low=0, high=len(generator.md), size=(latents.shape[0],)),
-                                dtype=jnp.int32)
-                            x_pred_intermediate = zernike3deep_decode_image(graphdef, state, latents, random_labels,
-                                                                            md_columns, ctf_type=None,
-                                                                            return_latent=False,
-                                                                            corrupt_projection_with_ctf=False)
-                            x_pred_intermediate = \
-                            image_resize(x_pred_intermediate[..., None], (latents.shape[0], 128, 128, 1),
-                                         method="bilinear")[..., 0]
-                            latents_images.append(np.asarray(x_pred_intermediate))
-                        latents_images = np.concatenate(latents_images, axis=0)
-                        latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)
-                        latent_images_max = latents_images.max(axis=(1, 2), keepdims=True)
-                        latents_images = (latents_images - latent_images_min) / (latent_images_max - latent_images_min)
-                        writer.add_embedding(latents_intermediate, label_img=latents_images[:, None, ...],
-                                             tag="Zernike3Deep latent space", global_step=i)
+                # Decode some states and show them in Tensorboard
+                volumes_intermediate = zernike3deep_decode_volume(graphdef, state, latents_intermediate)
+                writer.add_volumes_slices(volumes_intermediate)
 
-                        # Save checkpoint model
-                        NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT"),  epoch=i)
-
-                    i += 1
-
-                loss, recon_loss, state, rng = train_step_zernike3deep(graphdef, state, x, labels, md_columns, rng)
-                total_loss += loss
-                total_recon_loss += recon_loss
-
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
-
-                # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
+                # Log landscape stored in memory bank
+                if i > 0 and i % 5 == 0:
+                    choice_key_use, choice_key = jax.random.split(choice_key, 2)
                     zernike3deep_intermediate, _, _ = nnx.merge(graphdef, state)
+                    random_indices = jnr.choice(choice_key_use,
+                                                a=jnp.arange(zernike3deep_intermediate.bank_size),
+                                                shape=(zernike3deep_intermediate.subset_size,), replace=False)
+                    latents_intermediate = zernike3deep_intermediate.memory_bank.get_value()[random_indices]
+                    latents_data_loader = NumpyGenerator(latents_intermediate).return_grain_dataset(
+                        preShuffle=False, shuffle=False, batch_size=args.batch_size,
+                        num_epochs=1, num_workers=0)
+                    latents_images = []
+                    for (latents, _) in latents_data_loader:
+                        random_labels = jnp.asarray(
+                            np.random.randint(low=0, high=len(generator.md), size=(latents.shape[0],)),
+                            dtype=jnp.int32)
+                        x_pred_intermediate = zernike3deep_decode_image(graphdef, state, latents, random_labels,
+                                                                        md_columns, ctf_type=None,
+                                                                        return_latent=False,
+                                                                        corrupt_projection_with_ctf=False)
+                        x_pred_intermediate = \
+                        image_resize(x_pred_intermediate[..., None], (latents.shape[0], 128, 128, 1),
+                                     method="bilinear")[..., 0]
+                        latents_images.append(np.asarray(x_pred_intermediate))
+                    latents_images = np.concatenate(latents_images, axis=0)
+                    latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)
+                    latent_images_max = latents_images.max(axis=(1, 2), keepdims=True)
+                    latents_images = (latents_images - latent_images_min) / (latent_images_max - latent_images_min)
+                    writer.add_embedding(latents_intermediate, label_img=latents_images[:, None, ...],
+                                         tag="Zernike3Deep latent space", global_step=i)
 
-                    writer.add_scalar('Training loss (Zernike3Deep)',
-                                      total_loss / step,
-                                      i * steps_per_epoch + step)
+                    # Save checkpoint model
+                    NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT"),  epoch=i)
 
-                    writer.add_scalars('Image loss (Zernike3Deep)',
-                                       {"train": total_recon_loss / step},
-                                       i * steps_per_epoch + step)
+                i += 1
 
-                # Summary writer (validation loss)
-                if step % int(np.ceil(0.6 * steps_per_epoch)) == 0:
-                    # Run validation step
-                    pbar.set_postfix_str(f"{bcolors.WARNING}Running validation step...{bcolors.ENDC}")
-                    for _ in range(steps_per_val):
-                        (x_validation, labels_validation) = next(iter_data_loader_val)
-                        loss_validation = validation_step_zernike3deep(graphdef, state, x_validation,
-                                                                       labels_validation, md_columns, rng)
-                        total_validation_loss += loss_validation
-                        step_validation += 1
+            loss, recon_loss, state, rng = train_step_zernike3deep(graphdef, state, x, labels, md_columns, rng)
+            total_loss += loss
+            total_recon_loss += recon_loss
 
-                    writer.add_scalars('Image loss (Zernike3Deep)',
-                                       {"validation": total_validation_loss / step_validation},
-                                       i * steps_per_epoch + step)
+            # Progress bar update  (TQDM)
+            pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f} | graph_lambda={graph_lambda:.5f}")
 
-                step += 1
+            # Summary writer (training loss)
+            if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
+                zernike3deep_intermediate, _, _ = nnx.merge(graphdef, state)
+
+                writer.add_scalar('Training loss (Zernike3Deep)',
+                                  total_loss / step,
+                                  i * steps_per_epoch + step)
+
+                writer.add_scalars('Image loss (Zernike3Deep)',
+                                   {"train": total_recon_loss / step},
+                                   i * steps_per_epoch + step)
+
+            # Summary writer (validation loss)
+            if step % int(np.ceil(0.9 * steps_per_epoch)) == 0:
+                # Run validation step
+                pbar.set_postfix_str(f"{bcolors.WARNING}Running validation step...{bcolors.ENDC}")
+                for (x_validation, labels_validation) in data_loader_val:
+                    loss_validation = validation_step_zernike3deep(graphdef, state, x_validation,
+                                                                   labels_validation, md_columns, rng)
+                    total_validation_loss += loss_validation
+                    step_validation += 1
+
+                writer.add_scalars('Image loss (Zernike3Deep)',
+                                   {"validation": total_validation_loss / step_validation},
+                                   i * steps_per_epoch + step)
+
+            step += 1
+            total_steps += 1
 
         zernike3deep, optimizer, optimizer_grays = nnx.merge(graphdef, state)
 
@@ -1209,7 +1376,7 @@ def main():
 
         # Prepare data loader
         data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
-                                                     num_workers=6, load_to_ram=args.load_images_to_ram)
+                                                     num_workers=-1, load_to_ram=args.load_images_to_ram)
         steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
         # Jitted prediction function
