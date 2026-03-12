@@ -84,9 +84,9 @@ class Encoder(nnx.Module):
     def __init__(self, input_dim, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
 
-        hidden_layers = [nnx.Linear(self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers = [nnx.Linear(self.input_dim, 1024, rngs=rngs, dtype=jnp.float32)]
         for _ in range(3):
-            hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.float32))
         self.hidden_layers = nnx.List(hidden_layers)
 
     def __call__(self, x):
@@ -101,9 +101,9 @@ class Encoder(nnx.Module):
 class Decoder(nnx.Module):
     def __init__(self, lat_dim, output_dim, *, rngs: nnx.Rngs):
 
-        hidden_layers = [nnx.Linear(lat_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers = [nnx.Linear(lat_dim, 1024, rngs=rngs, dtype=jnp.float32)]
         for _ in range(3):
-            hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.float32))
         hidden_layers.append(nnx.Linear(1024, output_dim, rngs=rngs))
         self.hidden_layers = nnx.List(hidden_layers)
 
@@ -372,7 +372,7 @@ def main():
 
         # Prepare data loader
         data_loader = ArrayListGenerator(input_spaces).return_grain_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
-                                                                            num_workers=-1, num_epochs=None)
+                                                                            num_workers=6, num_epochs=None)
         steps_per_epoch = int(np.ceil(input_spaces[0].shape[0] / args.batch_size))
 
         # Optimizers (FlexConsensus)
