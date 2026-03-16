@@ -46,6 +46,7 @@ from PyQt5.QtWidgets import QSizePolicy, QApplication
 from PyQt5.QtCore import QThread
 
 from qtpy.QtWidgets import QSplitter, QTabWidget
+from qtpy.QtCore import QTimer
 
 import napari
 from napari.components.viewer_model import ViewerModel
@@ -396,7 +397,7 @@ class Annotate3D(object):
                                 for idx, original_sub_points in enumerate(original_points):
                                     _, inds = self.kdtree_data.query(original_sub_points, k=1)
                                     inds = np.array(inds).flatten()
-                                    original_points[idx] = np.copy(self.original_data[inds])
+                                    original_points[idx] = np.copy(self.original_data[inds])[:, self.current_axis]
                                 original_points = original_points.tolist()
                             else:
                                 original_points = np.copy(points)
@@ -603,6 +604,7 @@ class Annotate3D(object):
 
     def _compute_kmeans_fired(self):
         n_clusters = int(self.dock_widget.clustering_menu_widget.cluster_num.text())
+        self.active_clusters = [x + 1 for x in range(n_clusters)]
 
         # Auxilary function to update viewer layers
         def update_cluster_layers(centers_labels):
@@ -677,6 +679,7 @@ class Annotate3D(object):
     def _compute_dim_cluster_fired(self):
         axis = int(self.dock_widget.clustering_menu_widget.dimension_sel.currentText().replace("Dim ", "")) - 1
         n_clusters = int(self.dock_widget.clustering_menu_widget.cluster_num.text())
+        self.active_clusters = [x + 1 for x in range(n_clusters)]
 
         # Auxilary function to update viewer layers
         def update_cluster_layers(centers_labels):
@@ -795,37 +798,30 @@ class Annotate3D(object):
 
     def on_removing_layer(self, event):
         if self.allow_removing_cluster_layer:
-            self.allow_modifying_kmeans_layer = False
-            self.updating_landscape = True
             removed_layer = event.value
             if "Cluster_" in removed_layer.name:
                 cluster_id = int(removed_layer.name.split("_")[-1]) - 1
 
                 # Update saving data
                 if hasattr(self, "z_center"):
-                    self.z_center = np.delete(self.z_center, cluster_id, axis=0)
+                    delete_idx = self.active_clusters.index(cluster_id + 1)
+                    self.z_center = np.delete(self.z_center, delete_idx, axis=0)
+                    self.active_clusters.pop(delete_idx)
 
                 # Modify data in KMeans layer
-                layer = [layer for layer in self.dock_widget.viewer.layers if "KMeans" in layer.name]
-                if len(layer) > 0:
-                    layer = layer[0]
-                    layer.data = np.delete(layer.data, cluster_id, axis=0)
-                    self.current_kmeans_data = np.copy(layer.data)
-
-                # Rename layers
-                cluster_id = cluster_id + 2
-                layer_names = [layer.name for layer in self.dock_widget.viewer.layers]
-                while f"Cluster_{cluster_id}" in layer_names:
-                    layer = self.dock_widget.viewer.layers[f"Cluster_{cluster_id:05d}"]
-                    layer._fixed_name = f"Cluster_{cluster_id - 1:05d}"
-                    cluster_id += 1
-
-            self.allow_modifying_kmeans_layer = True
-            self.updating_landscape = False
+                def _deferred_deletion():
+                    self.allow_modifying_kmeans_layer = False
+                    self.updating_landscape = True
+                    delete_index = self.dock_widget.viewer.layers["KMeans"].text.values.tolist().index(f"Cluster {cluster_id + 1}")
+                    self.dock_widget.viewer.layers["KMeans"].selected_data = {delete_index}
+                    self.dock_widget.viewer.layers["KMeans"].remove_selected()
+                    self.current_kmeans_data = np.copy(self.dock_widget.viewer.layers["KMeans"].data)
+                    self.allow_modifying_kmeans_layer = True
+                    self.updating_landscape = False
+                QTimer.singleShot(1000, _deferred_deletion)
 
     def on_kmeans_layer_data_removal(self, event):
         if self.allow_modifying_kmeans_layer:
-            self.allow_removing_cluster_layer = False
             kmeans_layer = [layer for layer in self.dock_widget.viewer.layers if "KMeans" in layer.name][0]
             current_data = kmeans_layer.data
 
@@ -838,35 +834,26 @@ class Annotate3D(object):
             deleted_ids.sort(reverse=True)
 
             if deleted_points:
-                for deleted_id in deleted_ids:
-                    self.dock_widget.viewer.layers.remove(f"Cluster_{deleted_id + 1:05d}")
+                # Update saving data
+                if hasattr(self, "z_center"):
+                    self.z_center = np.delete(self.z_center, deleted_ids, axis=0)
 
-                    # Update saving data
-                    if hasattr(self, "z_center"):
-                        self.z_center = np.delete(self.z_center, deleted_id, axis=0)
-
-                # Update cluster layer names
-                for deleted_id in deleted_ids:
-                    cluster_layers = [layer for layer in self.dock_widget.viewer.layers if "Cluster_" in layer.name]
-                    for layer in cluster_layers:
-                        cluster_id = int(layer.name.split("_")[-1])
-                        if cluster_id > deleted_id + 1:
-                            layer._fixed_name = f"Cluster_{cluster_id - 1:05d}"
-
-            # Update KMeans layer labels
-            text = {
-                'string': [f"Cluster {idx + 1}" for idx in range(current_data.shape[0])],
-                'size': 10,
-                'color': 'white',
-                'translation': -3,
-            }
-            kmeans_layer.text = text
-            kmeans_layer.refresh()
+                def _deferred_deletion():
+                    self.allow_removing_cluster_layer = False
+                    self.dock_widget.viewer.layers.selection.clear()
+                    for deleted_id in deleted_ids:
+                        delete_layer_idx = self.active_clusters[deleted_id]
+                        self.dock_widget.viewer.layers.selection.add(self.dock_widget.viewer.layers[f"Cluster_{delete_layer_idx:05d}"])
+                    self.dock_widget.viewer.layers.remove_selected()
+                    for deleted_id in deleted_ids:
+                        self.active_clusters.pop(deleted_id)
+                    self.dock_widget.viewer.layers.selection.clear()
+                    self.dock_widget.viewer.layers.selection.add(self.dock_widget.viewer.layers["KMeans"])
+                    self.allow_removing_cluster_layer = True
+                QTimer.singleShot(1000, _deferred_deletion)
 
             # Update the previous data
             self.current_kmeans_data = current_data.copy()
-
-            self.allow_removing_cluster_layer = True
 
     def selectAxis(self, pos, event):
         axis = int(event.replace("Dim ", "")) - 1
@@ -1112,6 +1099,9 @@ class Annotate3D(object):
                          'formats': ncols * [pos.dtype]}
                 pos = np.setdiff1d(pos.view(dtype), prev_layer.view(dtype))
                 pos = pos.view(prev_layer.dtype).reshape(-1, ncols)
+
+            if pos.shape[0] == 0:
+                return
         else:
             layer = event.source
             if layer.mode == 'select':
