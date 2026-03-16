@@ -466,8 +466,8 @@ def training_step_images(graphdef, state, target, projection_parameters, sigma_r
     return loss_val, grads, state
 
 
-@jax.jit
-def training_step_local_adjustment(graphdef, state, target, projection_parameters):
+@partial(jax.jit, static_argnames=("ctf_type",))
+def training_step_local_adjustment(graphdef, state, target, projection_parameters, ctf_type):
     model, optimizer = nnx.merge(graphdef, state)
 
     def loss_fn(model, target):
@@ -475,6 +475,20 @@ def training_step_local_adjustment(graphdef, state, target, projection_parameter
 
         recon_loss = jnp.mean((recon_images - target) ** 2.)
         return recon_loss
+
+    # Precompute batch CTFs
+    pad_factor = 1 if model.grid_size > 256 else 2
+    if ctf_type in ["wiener", "precorrect"]:
+        defocusU = projection_parameters.pop("ctfDefocusU")
+        defocusV = projection_parameters.pop("ctfDefocusV")
+        defocusAngle = projection_parameters.pop("ctfDefocusAngle")
+        cs = projection_parameters.pop("ctfSphericalAberration")
+        kv = projection_parameters.pop("ctfVoltage")[0]
+        ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                         projection_parameters["sr"],
+                         [pad_factor * model.grid_size, int(pad_factor * 0.5 * model.grid_size  + 1)],
+                         target.shape[0], True)
+        target = wiener2DFilter(jnp.squeeze(target), ctf)[..., None]
 
     loss_val, grads = nnx.value_and_grad(loss_fn)(model, target)
 
@@ -811,7 +825,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
             # --- TRAIN STEP ---
             projection_parameters = {"euler_angles": md_columns["euler_angles"][labels],
                                      "shifts": md_columns["shifts"][labels]}
-            if "ctfDefocusU" in md_columns.keys() and ctf_type in ["apply", "wiener", "squared", "precorrect"]:
+            if ctf_type in ["apply", "wiener", "squared", "precorrect"]:
                 ctf_parameters = {"ctfDefocusU": md_columns["ctfDefocusU"][labels],
                                   "ctfDefocusV": md_columns["ctfDefocusV"][labels],
                                   "ctfDefocusAngle": md_columns["ctfDefocusAngle"][labels],
@@ -824,7 +838,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
                 loss_val, state = training_step_global_adjustment(graphdef, state, x[..., 0], projection_parameters,
                                                                   means, weights, sigma, grid_size=grid_size, ctf_type=ctf_type)
             else:
-                loss_val, state = training_step_local_adjustment(graphdef, state, x[..., 0], projection_parameters)
+                loss_val, state = training_step_local_adjustment(graphdef, state, x[..., 0], projection_parameters, ctf_type=ctf_type)
 
             loss_history.append(loss_val)
 
