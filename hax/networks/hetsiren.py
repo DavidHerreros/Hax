@@ -1587,10 +1587,16 @@ def main():
             if transport_mass:
                 # Prepare network (HetSIREN)
                 factor = 0.5 * generator.md.getMetaDataImage(0).shape[0]
-                coords = np.array(factor * model.means.get_value() + factor)
-                coords = np.stack([coords[..., 2], coords[..., 1], coords[..., 0]], axis=1)
-                values = np.array(jax.nn.relu(model.weights.get_value()))
-                sigma = jax.nn.relu(model.sigma_param.get_value())
+                if args.vol is not None:
+                    coords = np.array(factor * model.means.get_value() + factor)
+                    coords = np.stack([coords[..., 2], coords[..., 1], coords[..., 0]], axis=1)
+                    values = np.array(jax.nn.relu(model.weights.get_value()))
+                    sigma = jax.nn.relu(model.sigma_param.get_value())
+                else:
+                    inds = np.asarray(np.where(mask > 0.0)).T
+                    coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)
+                    values = jnp.zeros((inds.shape[0],))
+                    sigma = 1.0
             else:
                 inds = np.asarray(np.where(mask > 0.0)).T
                 coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)
@@ -1664,7 +1670,10 @@ def main():
                 total_validation_loss = 0
 
                 # Compute graph lambda
-                graph_lambda = 0.9
+                if args.vol is not None and model.delta_volume_decoder.transport_mass:
+                    graph_lambda = 0.9
+                else:
+                    graph_lambda = 0.0
                 # num_warmup_epochs = 3
                 # if i < num_warmup_epochs:
                 #     graph_lambda = 1.0
