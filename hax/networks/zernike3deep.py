@@ -1084,6 +1084,7 @@ def main():
         mask = ImageHandler(args.mask).getData()
     else:
         mask = ImageHandler(args.vol).generateMask(boxsize=64)
+        ImageHandler().write(mask, os.path.join(args.output_path, "mask.mrc"))
 
     # # If exists, clean MMAP
     # if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
