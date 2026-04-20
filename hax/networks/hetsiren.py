@@ -1574,7 +1574,7 @@ def main():
 
                     # Adjust to images
                     model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.0001,
-                                                        num_epochs=3, is_global=True, ctf_type=args.ctf_type)
+                                                        num_epochs=5, is_global=True, ctf_type=args.ctf_type)
 
                     # Save model
                     NeuralNetworkCheckpointer.save(model, fit_path)
