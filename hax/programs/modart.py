@@ -11,6 +11,7 @@ from einops import rearrange
 
 from hax.utils import *
 from hax.layers import *
+from hax.programs.gaussian_volume_fitting import FastVariableBlur3D
 
 
 def mse(a, b):
@@ -43,16 +44,18 @@ class DeltaVolume(nnx.Module):
         #     self.params = [nnx.Param(initializer(jax.random.key(0), (1, total_voxels * 4,), jnp.float32)),
         #                              nnx.Param(initializer(jax.random.key(1), (1, total_voxels * 4,), jnp.float32))]
 
-        self.hidden_linear = [Linear(in_features=total_voxels * 3, out_features=8, rngs=rngs, dtype=jnp.bfloat16,
+        hidden_linear = [Linear(in_features=total_voxels * 3, out_features=8, rngs=rngs, dtype=jnp.bfloat16,
                                      kernel_init=siren_init_first(c=1.))]
         for _ in range(4):
-            self.hidden_linear.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=1.)))
+            hidden_linear.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=1.)))
+        self.hidden_linear = nnx.List(hidden_linear)
 
         if self.num_maps == 1:
             self.params = Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs)
         else:
-            self.params = [Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs),
-                           Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs)]
+            params = [Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs),
+                      Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs)]
+            self.params = nnx.List(params)
 
     def __call__(self):
         # (keep this in case it is useful in the future)
@@ -196,7 +199,7 @@ class MoDART(nnx.Module):
 
 
 @jax.jit
-def single_step_modart(graphdef, state, x, labels, md, fields_modart, values_modart, key):
+def single_step_modart(graphdef, state, x, labels, md, fields_modart, key):
     model, optimizer = nnx.merge(graphdef, state)
 
     # Random keys
@@ -276,7 +279,7 @@ def single_step_modart(graphdef, state, x, labels, md, fields_modart, values_mod
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
     (loss, recon_loss), grads = grad_fn(model, x)
 
-    optimizer.update(grads)
+    optimizer.update(model, grads)
 
     state = nnx.state((model, optimizer))
 
@@ -289,39 +292,39 @@ def interpolate_image_field(graphdef, state, images, initial_inds_modart):
     model = nnx.merge(graphdef, state)
     map_coordinates_vmap = jax.vmap(map_coordinates, in_axes=(-1, None, None), out_axes=-1)
     factor = xsize / model.xsize
+    initial_scale = 0.5 * model.xsize
+    scale = 0.5 * xsize
 
     # Get coordinates and field
-    fields, values = model.decode_field(images)
+    images_resized = jax.image.resize(images, (images.shape[0], model.xsize, model.xsize, 1), method='bilinear')
+    fields, initial_coords = model.decode_field(images_resized)
     # fields_values = jnp.concatenate((fields, values[..., None]), axis=-1)
-    initial_inds = model.inds
+    initial_coords = jnp.round(initial_scale * initial_coords + initial_scale).astype(jnp.int32)
+    fields = scale * fields
     initial_inds_modart = initial_inds_modart / factor
 
     # Empty grids
-    grids = jnp.zeros((images.shape[0], images.shape[1], images.shape[1], images.shape[1], 3))
+    grids = jnp.zeros((images.shape[0], model.xsize, model.xsize, model.xsize, 3))
 
     # Place values on grid
     def place_on_single_grid(grid, inds, values):
-        grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 0].set(values[..., 0])
-        grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 1].set(values[..., 1])
-        grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 2].set(values[..., 2])
+        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 0].set(values[..., 0])
+        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 1].set(values[..., 1])
+        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 2].set(values[..., 2])
         # grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 0].set(values[..., 3])
         return grid
     place_on_grids = jax.vmap(place_on_single_grid, in_axes=(0, None, 0))
-    grids = place_on_grids(grids, initial_inds, fields)
+    grids = place_on_grids(grids, initial_coords, fields)
 
     # Low pass filter grids
-    fields_values_modart = []
+    gaussian_filter = FastVariableBlur3D((model.xsize, model.xsize, model.xsize))
+    grids = gaussian_filter(grids, sigma=1.0)
+    fields_modart = []
     for grid in grids:
-        grid_filtered = fast_gaussian_filter_3d(grid, sigma=1.0)
-        fields_values_modart.append(map_coordinates_vmap(grid_filtered, initial_inds_modart.T, 1))
-    fields_values_modart = jnp.stack(fields_values_modart, axis=0)
+        fields_modart.append(map_coordinates_vmap(grid, initial_inds_modart.T, 1))
+    fields_modart = jnp.stack(fields_modart, axis=0)
 
-    # Interpolate grids
-    # fields_modart = map_coordinates_vmap(grids_filtered, initial_inds_modart.T, 1)
-    fields_modart = factor * fields_values_modart
-    # fields_modart = jnp.stack([fields_modart[..., 2], fields_modart[..., 1], fields_modart[..., 0]], axis=-1)
-    # values_modart = fields_values_modart[..., 3]
-    return fields_modart, jnp.zeros_like(values)
+    return fields_modart
 
 
 def main():
@@ -334,6 +337,7 @@ def main():
     import argparse
     from xmipp_metadata.image_handler import ImageHandler
     import optax
+    from contextlib import closing, ExitStack
     from flax.training.early_stopping import EarlyStopping
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.metrics import JaxSummaryWriter
@@ -373,11 +377,20 @@ def main():
                              f"{bcolors.ENDC} or {bcolors.UNDERLINE} Zernike3Deep {bcolors.ENDC} neural network.")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the results (trained neural network, new metadata...)")
-    args = parser.parse_args()
+    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
+                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
+                             f"the default disk.")
+    args, _ = parser.parse_known_args()
 
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
     md_columns = extract_columns(generator.md)
+
+    # Prepare grain dataset
+    if not args.load_images_to_ram:
+        mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
+        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
+                                             precision=np.float16, group_size=1, shard_size=10000)
 
     # Preprocess volume (and mask)
     xsize = generator.md.getMetaDataImage(0).shape[0]
@@ -391,17 +404,9 @@ def main():
     else:
         mask = ImageHandler().createCircularMask(boxSize=xsize, radius=int(0.25 * xsize), is3D=True)
 
-    # Data loading approach
-    if args.load_images_to_ram:
-        mmap = False
-        mmap_output_dir = None
-    else:
-        mmap = True
-        mmap_output_dir = args.output_path
-
     # If exists, clean MMAP
-    if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
-        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
+    # if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
+    #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
 
     # Random keys
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
@@ -425,7 +430,7 @@ def main():
 
     if args.motion_correction is not None:
         # Reload network to perform motion correction
-        model = NeuralNetworkCheckpointer.load(None, args.motion_correction)
+        model = NeuralNetworkCheckpointer.load(args.motion_correction)
         graphdef_motion_correction, state_motion_correction = nnx.split(model)
 
     # Prepare summary writer
@@ -437,58 +442,84 @@ def main():
         model, _ = nnx.merge(graphdef, state)
         return model(filter=True)
 
+    # Prepare data loader
     if args.reconstruct_halves:
-        data_loader, data_loader_even, data_loader_odd = generator.return_tf_dataset(batch_size=int(0.5 * args.batch_size), shuffle=True, preShuffle=True,
-                                                                                     mmap=mmap, mmap_output_dir=mmap_output_dir, split_fraction=[0.5, 0.5])
+        data_loader_even, data_loader_odd = generator.return_grain_dataset(batch_size=int(0.5 * args.batch_size),
+                                                                           shuffle="global", num_epochs=None,
+                                                                           num_workers=-1, num_threads=1,
+                                                                           split_fraction=[0.5, 0.5],
+                                                                           load_to_ram=args.load_images_to_ram)
+        steps_per_epoch_even = int(int(0.5 * len(generator.md)) / args.batch_size)
     else:
-        # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
-                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
+        data_loader = generator.return_grain_dataset(batch_size=args.batch_size,  shuffle="global", num_epochs=None,
+                                                     num_workers=-1, num_threads=1, split_fraction=None,
+                                                     load_to_ram=args.load_images_to_ram)
+    steps_per_epoch = int(len(generator.md) / args.batch_size)
 
     # Example of training data for Tensorboard
-    x_example, labels_example = next(iter(data_loader))
-    x_example = jax.vmap(min_max_scale)(x_example)
-    writer.add_images("Example of data batch", x_example, dataformats="NHWC")
+    with closing(iter(data_loader)) as iter_data_loader:
+        x_example, labels_example = next(iter_data_loader)
+        x_example = jax.vmap(min_max_scale)(x_example)
+        writer.add_images("Example of data batch", x_example, dataformats="NHWC")
 
     if args.vol is not None:
-        # Optimizers (Volume Adjustment)
-        optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
-        graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
+        checkpoint_volume_adjustment = os.path.join(args.output_path, "VolumeAdjustment")
+        if not os.path.isdir(checkpoint_volume_adjustment):
+            # Optimizers (Volume Adjustment)
+            optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5), wrt=nnx.Param)
+            graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
 
-        # Number epochs (volume adjustment)
-        if len(generator.md) >= 10000:
-            num_epochs_vol = 20
+            # Number epochs (volume adjustment)
+            if len(generator.md) >= 1000000:
+                num_epochs_vol = 5
+            else:
+                num_epochs_vol = 20
+
+            data_loader_vol = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global", num_epochs=None,
+                                                             num_workers=-1, num_threads=1, split_fraction=None,
+                                                             load_to_ram=args.load_images_to_ram)
+
+            # Training loop (Volume Adjustment)
+            print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
+
+            i = 0
+            pbar = tqdm(range(num_epochs_vol * steps_per_epoch), file=sys.stdout, ascii=" >=",
+                        colour="green",
+                        bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+
+            with closing(iter(data_loader_vol)) as iter_data_loader_vol:
+                for total_steps in pbar:
+                    (x, labels) = next(iter_data_loader_vol)
+
+                    if total_steps % steps_per_epoch == 0:
+                        total_loss = 0
+
+                        # For progress bar (TQDM)
+                        step = 1
+                        pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{num_epochs_vol}")
+
+                    i += 1
+
+                    loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
+                                                               args.ctf_type, vol.shape[0])
+                    total_loss += loss
+
+                    # Progress bar update  (TQDM)
+                    pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+
+                    # Summary writer (training loss)
+                    if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
+                        writer.add_scalar('Training loss (volume adjustment)',
+                                          total_loss / step,
+                                          i * steps_per_epoch + step)
+
+                    step += 1
+
+            volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
+            NeuralNetworkCheckpointer.save(volumeAdjustment, checkpoint_volume_adjustment)
         else:
-            num_epochs_vol = 200
+            volumeAdjustment = NeuralNetworkCheckpointer.load(checkpoint_path=checkpoint_volume_adjustment)
 
-        # Training loop (Volume Adjustment)
-        print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
-        for i in range(num_epochs_vol):
-            total_loss = 0
-
-            # For progress bar (TQDM)
-            step = 1
-            print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
-            pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
-                        colour="green")
-
-            for (x, labels) in pbar:
-                loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
-                                                           args.ctf_type, vol.shape[0])
-                total_loss += loss
-
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
-
-                # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
-                    writer.add_scalar('Training loss (volume adjustment)',
-                                      total_loss / step,
-                                      i * len(data_loader) + step)
-
-                step += 1
-
-        volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
         values = volumeAdjustment()
 
         # Place values on grid and replace MoDART reference volume
@@ -498,7 +529,7 @@ def main():
         modart.delta_volume_decoder.reference_values = values
 
     # Learning rate scheduler
-    total_steps_per_epoch =  len(data_loader) if not args.reconstruct_halves else len(data_loader_even)
+    total_steps_per_epoch =  steps_per_epoch if not args.reconstruct_halves else steps_per_epoch_even
     total_steps = 20 * total_steps_per_epoch
     lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=1e-3, total_steps=total_steps, warmup_frac=0.1, init_value=0.0, end_value=0.0)
 
@@ -506,35 +537,84 @@ def main():
     early_stop = EarlyStopping(min_delta=1e-6, patience=2. * total_steps_per_epoch)
 
     # Optimizers (MoDART)
-    optimizer = nnx.Optimizer(modart, optax.adam(lr_schedule))
+    optimizer = nnx.Optimizer(modart, optax.adam(lr_schedule), wrt=nnx.Param)
     graphdef, state = nnx.split((modart, optimizer))
 
     # Reconstruction loop (MoDART)
     print(f"{bcolors.OKCYAN}\n###### Starting MoDART reconstruction... ######")
+
     i = 0
-    while not early_stop.should_stop:
-        total_loss = 0
-        total_recon_loss = 0 if not args.reconstruct_halves else jnp.zeros((2, ))
+    total_steps = 0
+    pbar = tqdm(range(steps_per_epoch), file=sys.stdout, ascii=" >=", colour="green",
+                bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
-        # For progress bar (TQDM)
-        step = 1
-        print(f'\nReconstruction epochs |')
+    with ExitStack() as stack:
         if args.reconstruct_halves:
-            pbar = tqdm(zip(data_loader_even, data_loader_odd), desc=f"Epoch {i + 1}", file=sys.stdout, ascii=" >=", colour="green", total=len(data_loader_even))
+            iter_data_loader_even = stack.enter_context(closing(iter(data_loader_even)))
+            iter_data_loader_odd = stack.enter_context(closing(iter(data_loader_odd)))
+        else:
+            iter_data_loader = stack.enter_context(closing(iter(data_loader)))
 
-            for (x_even, labels_even), (x_odd, labels_odd) in pbar:
+        while not early_stop.should_stop:
+
+            if total_steps % steps_per_epoch == 0:
+
+                total_loss = 0
+                total_recon_loss = 0 if not args.reconstruct_halves else jnp.zeros((2, ))
+
+                # For progress bar (TQDM)
+                step = 1
+                pbar.reset()
+                pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}")
+
+                # Intermediate volume
+                modart_volume = get_modart_volume(graphdef, state)
+                if args.reconstruct_halves:
+                    middle_slize = int(np.round(0.5 * modart_volume[0].shape[-1]))
+                    ImageHandler().write(np.array(modart_volume[0]),
+                                         os.path.join(args.output_path, "modart_first_half_intermediate.mrc"),
+                                         overwrite=True)
+                    ImageHandler().write(np.array(modart_volume[1]),
+                                         os.path.join(args.output_path, "modart_second_half_intermediate.mrc"),
+                                         overwrite=True)
+                    slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[0][middle_slize, :, :]),
+                                                    min_max_scale(modart_volume[0][:, middle_slize, :]),
+                                                    min_max_scale(modart_volume[0][:, :, middle_slize]))
+                    slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
+                    writer.add_images("Predicted MoDART first half (slices)", slices, dataformats="NHWC", global_step=i)
+                    slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[1][middle_slize, :, :]),
+                                                    min_max_scale(modart_volume[1][:, middle_slize, :]),
+                                                    min_max_scale(modart_volume[1][:, :, middle_slize]))
+                    slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
+                    writer.add_images("Predicted MoDART second half (slices)", slices, dataformats="NHWC",
+                                      global_step=i)
+                else:
+                    middle_slize = int(np.round(0.5 * modart_volume.shape[-1]))
+                    ImageHandler().write(np.array(modart_volume),
+                                         os.path.join(args.output_path, "modart_map_intermediate.mrc"), overwrite=True)
+                    slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[middle_slize, :, :]),
+                                                    min_max_scale(modart_volume[:, middle_slize, :]),
+                                                    min_max_scale(modart_volume[:, :, middle_slize]))
+                    slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
+                    writer.add_images("Predicted MoDART volume (slices)", slices, dataformats="NHWC", global_step=i)
+
+                i += 1
+
+            # For progress bar (TQDM)
+            if args.reconstruct_halves:
+                (x_even, labels_even) = next(iter_data_loader_even)
+                (x_odd, labels_odd) = next(iter_data_loader_odd)
                 x = jnp.stack([x_even, x_odd], axis=1)
                 labels = jnp.stack([labels_even, labels_odd], axis=1)
 
                 if args.motion_correction is not None:
                     x_interpolation = jnp.reshape(x, (-1, x.shape[2], x.shape[3], 1))
-                    field_modart, values_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x_interpolation, modart.inds)
-                    field_modart = np.reshape(x, (x.shape[0], x.shape[1], field_modart.shape[1], field_modart.shape[2]))
+                    field_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x_interpolation, modart.inds)
+                    field_modart = jnp.reshape(x, (x.shape[0], x.shape[1], field_modart.shape[1], field_modart.shape[2]))
                 else:
-                    field_modart = np.zeros((x.shape[0], modart.inds.shape[0], 4))[:, None, ...]
-                    values_modart = np.zeros((x.shape[0], modart.inds.shape[0]))[:, None, ...]
+                    field_modart = jnp.zeros((x.shape[0], modart.inds.shape[0], 3))[:, None, ...]
 
-                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, values_modart, rng)
+                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
@@ -542,14 +622,14 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss.mean() / step:.5f}")
 
                 # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * len(data_loader_even))) == 0:
+                if step % int(np.ceil(0.1 * steps_per_epoch_even)) == 0:
                     writer.add_scalar('Training loss (MoDART)',
                                       total_loss / step,
-                                      i * len(data_loader_even) + step)
+                                      i * steps_per_epoch_even + step)
 
                     writer.add_scalars('Reconstruction loss (MoDART)',
                                        {"First half": total_recon_loss[0] / step, "Second half": total_recon_loss[1] / step},
-                                       i * len(data_loader_even) + step)
+                                       i * steps_per_epoch_even + step)
 
                 # Update early stopping criteria
                 early_stop = early_stop.update(total_loss / step)
@@ -559,22 +639,18 @@ def main():
                     break
 
                 step += 1
-        else:
-            pbar = tqdm(data_loader, desc=f"Epoch {i + 1}", file=sys.stdout, ascii=" >=", colour="green")
-
-            for (x, labels) in pbar:
+            else:
+                (x, labels) = next(iter_data_loader)
                 if args.motion_correction is not None:
-                    field_modart, values_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x, modart.inds)
+                    field_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x, modart.inds)
                 else:
-                    field_modart = np.zeros((x.shape[0], modart.inds.shape[0], 4))
-                    values_modart = np.zeros((x.shape[0], modart.inds.shape[0]))
+                    field_modart = jnp.zeros((x.shape[0], modart.inds.shape[0], 3))
 
                 x = x[:, None, ...]
                 labels = labels[:, None, ...]
                 field_modart = field_modart[:, None, ...]
-                values_modart = values_modart[:, None, ...]
 
-                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, values_modart, rng)
+                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss[0]
 
@@ -582,14 +658,14 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
 
                 # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
+                if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
                     writer.add_scalar('Training loss (MoDART)',
                                       total_loss / step,
-                                      i * len(data_loader) + step)
+                                      i * steps_per_epoch + step)
 
                     writer.add_scalar('Reconstruction loss (MoDART)',
                                       total_recon_loss / step,
-                                      i * len(data_loader) + step)
+                                      i * steps_per_epoch + step)
 
                 # Update early stopping criteria
                 early_stop = early_stop.update(total_loss / step)
@@ -599,32 +675,8 @@ def main():
 
                 step += 1
 
-        # Intermediate volume
-        modart_volume = get_modart_volume(graphdef, state)
-        if args.reconstruct_halves:
-            middle_slize = int(np.round(0.5 * modart_volume[0].shape[-1]))
-            ImageHandler().write(np.array(modart_volume[0]), os.path.join(args.output_path, "modart_first_half_intermediate.mrc"), overwrite=True)
-            ImageHandler().write(np.array(modart_volume[1]), os.path.join(args.output_path, "modart_second_half_intermediate.mrc"), overwrite=True)
-            slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[0][middle_slize, :, :]),
-                                            min_max_scale(modart_volume[0][:, middle_slize, :]),
-                                            min_max_scale(modart_volume[0][:, :, middle_slize]))
-            slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-            writer.add_images("Predicted MoDART first half (slices)", slices, dataformats="NHWC", global_step=i)
-            slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[1][middle_slize, :, :]),
-                                            min_max_scale(modart_volume[1][:, middle_slize, :]),
-                                            min_max_scale(modart_volume[1][:, :, middle_slize]))
-            slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-            writer.add_images("Predicted MoDART second half (slices)", slices, dataformats="NHWC", global_step=i)
-        else:
-            middle_slize = int(np.round(0.5 * modart_volume.shape[-1]))
-            ImageHandler().write(np.array(modart_volume), os.path.join(args.output_path, "modart_map_intermediate.mrc"), overwrite=True)
-            slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[middle_slize, :, :]),
-                                            min_max_scale(modart_volume[:, middle_slize, :]),
-                                            min_max_scale(modart_volume[:, :, middle_slize]))
-            slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-            writer.add_images("Predicted MoDART volume (slices)", slices, dataformats="NHWC", global_step=i)
-
-        i += 1
+            pbar.update()
+            total_steps += 1
 
     # Save final MoDART volume
     modart_volume = get_modart_volume(graphdef, state)
@@ -635,6 +687,6 @@ def main():
     else:
         ImageHandler().write(np.array(modart_volume), os.path.join(args.output_path, "modart_map.mrc"), overwrite=True)
 
-
-if __name__ == "__main__":
-    main()
+    # If exists, clean MMAP
+    # if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
+    #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))

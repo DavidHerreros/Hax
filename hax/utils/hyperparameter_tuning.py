@@ -11,7 +11,7 @@ def find_max_batch_size(graphdef, state, step, md, rng, input_shape_per_sample):
     batch_size = 8
     max_fitted_batch_size = 0
 
-    print("Testing batch sizes...")
+    print(f"{bcolors.OKCYAN}\n###### Automatic batch size tuning... ######{bcolors.ENDC}")
 
     while True:
         try:
@@ -32,8 +32,8 @@ def find_max_batch_size(graphdef, state, step, md, rng, input_shape_per_sample):
             # Double the batch size
             batch_size *= 2
 
-            # Optional: Break if batch size is unreasonably large
-            if batch_size > 65536:
+            # Optional: Break if batch size is unreasonably large (above 256 weird errors may appear)
+            if batch_size > 256:
                 break
 
         except (RuntimeError, jax.errors.JaxRuntimeError) as e:
@@ -46,6 +46,6 @@ def find_max_batch_size(graphdef, state, step, md, rng, input_shape_per_sample):
                 raise e  # Re-raise if it's a different error
 
         # Clear backend caches to free up fragmented memory between attempts
-        jax.clear_caches()
+        # jax.clear_caches()
 
     return max_fitted_batch_size // 2

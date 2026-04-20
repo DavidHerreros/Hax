@@ -1,19 +1,40 @@
 import jax
 from jax import numpy as jnp, lax as jlx
 from jax.scipy.ndimage import map_coordinates
+from flax import nnx
 import numpy as np
 from scipy import signal
 
 
-def low_pass_2d(x, gauss_1d):
-    ft_kernel = jnp.einsum('i,j->ij', gauss_1d, gauss_1d)[None, ...]
+class FastVariableBlur2D(nnx.Module):
+    def __init__(self, shape: tuple[int, int]):
+        self.h, self.w = shape
 
-    # Apply kernel Fourier
-    ft_x = jnp.fft.fftshift(jnp.fft.fftn(x, axes=(1, 2)))
-    ft_x_real = ft_x.real * ft_kernel
-    ft_x_imag = ft_x.imag * ft_kernel
-    ft_x = jlx.complex(ft_x_real, ft_x_imag)
-    return jnp.fft.ifftn(jnp.fft.ifftshift(ft_x), axes=(1, 2)).real
+        # Precompute ONLY the frequency grid coordinates (constant)
+        fy = jnp.fft.fftfreq(self.h)[:, None]  # (H, 1)
+        fx = jnp.fft.rfftfreq(self.w)[None, :]  # (1, W/2 + 1)
+
+        # Precompute squared frequency radius
+        self.f_sq = fx ** 2 + fy ** 2
+
+    def __call__(self, x: jax.Array, sigma: float) -> jax.Array:
+        """
+        Args:
+            x: Input image batch (B, H, W, C)
+            sigma: The blur strength (pixels) for this specific step.
+        """
+        # Generate Gaussian Mask on-the-fly
+        mask = jnp.exp(-2 * jnp.pi ** 2 * sigma ** 2 * self.f_sq)
+
+        # RFFT (Real -> Complex)
+        spectrum = jnp.fft.rfft2(x, axes=(1, 2))
+
+        # Apply Mask
+        mask = mask[None, ..., None]
+        filtered_spectrum = spectrum * mask
+
+        # IRFFT (Complex -> Real)
+        return jnp.fft.irfft2(filtered_spectrum, s=(self.h, self.w), axes=(1, 2))
 
 def low_pass_3d(x, std=1.0):
     size = x.shape[0]
@@ -113,10 +134,11 @@ def wiener2DFilter(images, ctf, pad_factor=2):
     xsize = images.shape[1]
 
     ctf_2 = ctf * ctf
-    epsilon = 0.1 * jnp.mean(ctf_2)
+    epsilon = 0.1 * jnp.mean(ctf_2, axis=(-2, -1), keepdims=True)
 
-    pad_diff = xsize * (pad_factor - 1) // pad_factor
-    images = jnp.pad(images, ((0, 0), (pad_diff, pad_diff), (pad_diff, pad_diff)), mode="constant")
+    if pad_factor > 1:
+        pad_diff = xsize * (pad_factor - 1) // pad_factor
+        images = jnp.pad(images, ((0, 0), (pad_diff, pad_diff), (pad_diff, pad_diff)), mode="constant")
 
     ft_images = jnp.fft.fftshift(jnp.fft.rfft2(images))
     ft_ctf_images_real = ft_images.real * ctf / (ctf_2 + epsilon)
@@ -124,15 +146,17 @@ def wiener2DFilter(images, ctf, pad_factor=2):
     ft_ctf_images = jlx.complex(ft_ctf_images_real, ft_ctf_images_imag)
     images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_ctf_images))
 
-    images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
+    if pad_factor > 1:
+        images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
 
     return images
 
 def ctfFilter(images, ctf, pad_factor=2):
     xsize = images.shape[1]
 
-    pad_diff = xsize * (pad_factor - 1) // pad_factor
-    images = jnp.pad(images, ((0, 0), (pad_diff, pad_diff), (pad_diff, pad_diff)), mode="constant")
+    if pad_factor > 1:
+        pad_diff = xsize * (pad_factor - 1) // pad_factor
+        images = jnp.pad(images, ((0, 0), (pad_diff, pad_diff), (pad_diff, pad_diff)), mode="constant")
 
     ft_images = jnp.fft.fftshift(jnp.fft.rfft2(images))
     ft_ctf_images_real = ft_images.real * ctf
@@ -140,7 +164,8 @@ def ctfFilter(images, ctf, pad_factor=2):
     ft_ctf_images = jlx.complex(ft_ctf_images_real, ft_ctf_images_imag)
     images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_ctf_images))
 
-    images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
+    if pad_factor > 1:
+        images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
 
     return images
 

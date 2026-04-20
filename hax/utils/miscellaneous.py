@@ -1,5 +1,6 @@
 import sys
 from tqdm import tqdm
+from contextlib import closing
 
 import pynndescent
 from cuml.neighbors.nearest_neighbors import NearestNeighbors
@@ -8,6 +9,9 @@ import jax
 import jax.numpy as jnp
 
 from functools import partial
+
+import numpy as np
+from sklearn.neighbors import KDTree
 
 from hax.generators import NumpyGenerator
 from hax.utils.loggers import bcolors
@@ -134,7 +138,9 @@ def estimate_noise_stddev(images, radius_fraction=0.5):
 
 def filter_latent_space(space, thr=1.0, k=10, return_ids=False, batch_size=64):
     # Prepare data loader
-    data_loader = NumpyGenerator(space).return_tf_dataset(batch_size=batch_size, preShuffle=False, shuffle=False, prefetch=20)
+    data_loader = NumpyGenerator(space).return_grain_dataset(batch_size=batch_size, preShuffle=False, shuffle=False,
+                                                             num_epochs=1, num_workers=0)
+    steps_per_epoch = int(np.ceil(space.shape[0] / batch_size))
 
     # Compute distance distributions
     distribution = []
@@ -152,11 +158,14 @@ def filter_latent_space(space, thr=1.0, k=10, return_ids=False, batch_size=64):
         raise ValueError(f"Backend {jax.default_backend()} not supported")
 
     print(f"{bcolors.OKCYAN}\n###### Filtering latents... ######")
-    pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
-    for (z, _) in pbar:
-        distances = nn_fn(z)
-        distribution.append(jnp.mean(distances[:, 1:], axis=1))
-    distribution = jnp.hstack(distribution)
+    pbar = tqdm(range(steps_per_epoch), desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green",
+                bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+    with closing(iter(data_loader)) as iter_data_loader:
+        for _ in pbar:
+            (z, _) = next(iter_data_loader)
+            distances = nn_fn(z)
+            distribution.append(jnp.mean(distances[:, 1:], axis=1))
+        distribution = jnp.hstack(distribution)
 
     # Compute Z-Scores
     z_scores = jnp.abs((distribution - jnp.mean(distribution)) / jnp.std(distribution))
@@ -410,3 +419,206 @@ def sparse_finite_3D_differences(values, inds, vol_dim):
         return diff_x, diff_y, diff_z
 
     return _single_batch_diff(values, inds)
+
+
+def build_graph_from_coordinates(
+    centers,
+    k_knn: int = 6,
+    k_spacing: int = 2,
+    radius_factor: float = 1.5,
+    undirected: bool = False,
+):
+    """
+    Memory-efficient model-free graph construction using sklearn KDTree.
+
+    Parameters
+    ----------
+    centers : jnp.ndarray or np.ndarray, shape (N, 3)
+        Pseudo-atom centers.
+    k_spacing : int, default=2
+        Number of nearest neighbours to estimate local spacing (2 in DynaMight).
+        We will query k+1 neighbors because the first one is the point itself.
+    k_knn : int, default=6
+        Number of nearest neighbours to estimate connection graph (6 in DynaMight).
+        We will query k+1 neighbors because the first one is the point itself.
+    radius_factor : float, default=1.5
+        Multiplier for the mean k-NN distance to set the radius.
+    leaf_size : int, default=40
+        KDTree leaf_size parameter (controls speed/memory trade-off).
+    metric : str, default="euclidean"
+        Distance metric for KDTree.
+    undirected : bool, default=False
+        If True, keep only one edge per undirected pair (i < j).
+        If False, keep both directions (i->j and j->i).
+
+    Returns
+    -------
+    edge_index : jnp.ndarray, shape (2, E), dtype=int32
+        Edge list [i, j] for the graph.
+    cutoff : jnp.ndarray, scalar
+        Radius used to connect nodes.
+    """
+    # Convert to numpy for sklearn
+    if isinstance(centers, jnp.ndarray):
+        centers_np = np.asarray(centers)
+    else:
+        centers_np = np.asarray(centers, dtype=np.float32)
+
+    # Build KDTree on CPU
+    tree = KDTree(centers_np)
+
+    # Estimate mean k-NN distance (excluding self)
+    dists, idxs = tree.query(centers_np, k=k_spacing + 1)
+    knn_dists = dists[:, 1 : k_spacing + 1]  # (N, k)
+    mean_k = knn_dists.mean()        # scalar float
+    cutoff = radius_factor * mean_k
+
+    # Radius neighbors graph
+    ind_array = tree.query_radius(centers_np, r=cutoff, return_distance=False)
+
+    edges_i = []
+    edges_j = []
+
+    if undirected:
+        # Only keep edges with j > i to avoid duplicates
+        for i, neigh in enumerate(ind_array):
+            for j in neigh:
+                if j == i:
+                    continue
+                if j > i:
+                    edges_i.append(i)
+                    edges_j.append(j)
+    else:
+        # Keep directed edges (i -> j), excluding self
+        for i, neigh in enumerate(ind_array):
+            for j in neigh:
+                if j == i:
+                    continue
+                edges_i.append(i)
+                edges_j.append(j)
+
+    edges_i = np.asarray(edges_i, dtype=np.int32)
+    edges_j = np.asarray(edges_j, dtype=np.int32)
+
+    # Compute edge weights
+    if edges_i.size == 0:
+        edge_index_np = np.zeros((2, 0), dtype=np.int32)
+        edge_weights_np = np.zeros((0,), dtype=np.float32)
+    else:
+        edge_index_np = np.stack([edges_i, edges_j], axis=0)
+
+        # Get distances in consensus model
+        diffs = centers_np[edges_i] - centers_np[edges_j]
+        dists = np.linalg.norm(diffs, axis=-1)
+
+        # Gaussian weighting
+        sigma = mean_k
+        edge_weights_np = np.exp(-(dists ** 2.) / (2. * sigma ** 2.))
+
+        # Compute Degree Normalization (Optional but stabilizes training)
+        # Ensures total weight per node is roughly consistent
+        # unique, counts = np.unique(edges_i, return_counts=True)
+        # degree_map = dict(zip(unique, counts))
+        # node_degrees = np.array([degree_map.get(idx, 1) for idx in edges_i])
+        # edge_weights_np = edge_weights_np / node_degrees
+
+    # Build KNN graph (for Outlier Loss)
+    dists_knn, idxs_knn = tree.query(centers_np, k=k_knn + 1)
+    edges_i_knn = np.repeat(np.arange(centers_np.shape[0]), k_knn)
+    edges_j_knn = idxs_knn[:, 1:].flatten()
+    edge_index_knn_np = np.stack([edges_i_knn, edges_j_knn], axis=0)
+
+    # Convert back to JAX
+    edge_index = jnp.asarray(edge_index_np)
+    edge_weights = jnp.asarray(edge_weights_np, dtype=jnp.float32)
+    consensus_distances = jnp.asarray(dists, dtype=jnp.float32)
+    edge_index_knn = jnp.asarray(edge_index_knn_np)
+    cutoff_jnp = jnp.asarray(cutoff, dtype=centers.dtype if isinstance(centers, jnp.ndarray) else jnp.float32)
+
+    return edge_index, edge_weights, consensus_distances, consensus_distances.mean(), edge_index_knn, cutoff_jnp
+
+
+def sample_mask_points(mask, N):
+    """
+    Selects N random points from a binary mask without replacement.
+
+    Args:
+        mask (np.ndarray): The input boolean or binary mask (M, M, M).
+        N (int): The number of points to select.
+
+    Returns:
+        np.ndarray: A new mask of the same shape with only the N selected points.
+    """
+    # 1. Find the flat indices of all non-zero elements (points equal to 1)
+    flat_indices = np.flatnonzero(mask)
+
+    # Safety check: ensure we have enough points to sample
+    if len(flat_indices) < N:
+        raise ValueError(f"Mask only has {len(flat_indices)} points, cannot sample {N}.")
+
+    # 2. Randomly select N indices without replacement
+    # explicit generator is used for better reproducibility control,
+    # but np.random.choice works fine too.
+    rng = np.random.default_rng()
+    selected_indices = rng.choice(flat_indices, size=N, replace=False)
+
+    # 3. Create an empty flat volume
+    out_flat = np.zeros(mask.size, dtype=mask.dtype)
+
+    # 4. Set the selected points to 1
+    out_flat[selected_indices] = 1
+
+    # 5. Reshape back to the original (M, M, M) dimensions
+    return out_flat.reshape(mask.shape)
+
+
+def safe_norm(x, axis=-1, eps=1e-8):
+    return jnp.sqrt(jnp.sum(jnp.square(x), axis=axis) + eps)
+
+
+def positional_encoding(coords: jax.Array, enc_dim: int, DD: int) -> jax.Array:
+    """Positional encoding of continuous coordinates.
+
+    Maps continuous input coordinates into a higher-dimensional space using
+    logarithmically spaced frequencies. This allows coordinate-based neural
+    networks to learn high-frequency details.
+
+    Parameters
+    ----------
+    coords: jax.Array
+        `(n, 3)` array of input coordinates.
+    enc_dim: int
+        The number of frequency bands to generate.
+    DD: int
+        A scaling factor (often related to the box size or domain diameter).
+
+    Returns
+    -------
+    jax.Array
+        The positionally encoded coordinates.
+    """
+    D2 = DD // 2
+
+    # freqs: shape (enc_dim,)
+    freqs = jnp.arange(enc_dim, dtype=jnp.float32)
+    freqs = D2 * (1. / D2) ** (freqs / (enc_dim - 1))
+
+    # Reshape freqs to broadcast with coords: e.g., (1, 1, enc_dim)
+    shape = (1,) * coords.ndim + (-1,)
+    freqs = jnp.reshape(freqs, shape)
+
+    # Expand coords: e.g., (n, 3, 1)
+    coords_expanded = jnp.expand_dims(coords, axis=-1)
+
+    # k: shape (n, 3, enc_dim)
+    k = coords_expanded * freqs
+
+    s = jnp.sin(k)
+    c = jnp.cos(k)
+
+    # Concatenate along the last axis: shape (n, 3, enc_dim * 2)
+    x = jnp.concatenate([s, c], axis=-1)
+
+    # Flatten the last two dimensions: shape (n, 3 * enc_dim * 2)
+    new_shape = x.shape[:-2] + (-1,)
+    return jnp.reshape(x, new_shape)

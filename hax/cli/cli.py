@@ -39,11 +39,11 @@ class PrintSummary(argparse.Action):
             print(f"     - {bcolors.ITALIC}{bcolors.BOLD}{key}{bcolors.ENDC}: {value[1]}")
 
         print(f"\n{bcolors.HEADER}Example of usage:{bcolors.ENDC}\n")
-        print("     project manager --gpu 0 {Run only on this GPU} program --program_arg_1 #Val_1 --program arg_2 #Val_2 ...\n")
+        print("     hax_project_manager --gpu 0 {Run only on this GPU} program --program_arg_1 #Val_1 --program arg_2 #Val_2 ...\n")
         print(f"{bcolors.HEADER}Additional help on how to execute each is available through:{bcolors.ENDC}\n")
-        print("     project manager program {-h or --help}\n")
-        print(f"{bcolors.WARNING}If you experience any issue or have suggestions, you are welcome to write an issue in our GitHub!: {bcolors.UNDERLINE}XXX\n{bcolors.ENDC}\n")
-        print(f"{bcolors.OKBLUE}We also provide tutorials on how to use the software with Scipion in the following link: {bcolors.UNDERLINE}XXX\n{bcolors.ENDC}\n")
+        print(f"     hax_project_manager {bcolors.ITALIC}{bcolors.BOLD}program{bcolors.ENDC} {-h or --help}\n")
+        print(f"{bcolors.WARNING}If you experience any issue or have suggestions, you are welcome to write an issue in our GitHub!: {bcolors.UNDERLINE}https://github.com/DavidHerreros/Hax/issues\n{bcolors.ENDC}\n")
+        print(f"{bcolors.OKBLUE}We also provide tutorials on how to use the software with Scipion in the following link: {bcolors.UNDERLINE}VERY SOON!\n{bcolors.ENDC}\n")
         parser.exit(0)
 
 def main():
@@ -68,26 +68,30 @@ def main():
         help="Arguments to pass along to the previously selected program"
     )
 
-    ns = parser.parse_args()
+    ns, _ = parser.parse_known_args()
 
     # 1) set the env var before any JAX import
-    child_env = os.environ.copy()
     if ns.gpu is not None:
-        child_env["CUDA_VISIBLE_DEVICES"] = ns.gpu
-    child_env.pop("LD_LIBRARY_PATH", None)
-    child_env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    child_env["XLA_FLAGS"] = (
+        os.environ["CUDA_VISIBLE_DEVICES"] = ns.gpu
+    os.environ.pop("LD_LIBRARY_PATH", None)
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    os.environ["XLA_FLAGS"] = (
         "--xla_gpu_triton_gemm_any=true "
         "--xla_gpu_enable_latency_hiding_scheduler=true "
         "--xla_gpu_enable_highest_priority_async_stream=true "
     )
-    child_env["TF_CPP_MIN_LOG_LEVEL"] = "2"
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
     # 2) Prepare command
-    file = importlib.import_module(MODULES_DICT[ns.program][0]).__file__
-    cmd = [sys.executable, file, *ns.args]
+    module = importlib.import_module(MODULES_DICT[ns.program][0])
+    main_fn = getattr(module, "main")
 
-    sys.exit(subprocess.call(cmd, env=child_env))
+    # 3) Run function
+    main_fn()
 
 if __name__ == "__main__":
+    import multiprocessing
+    # multiprocessing.set_start_method("spawn", force=True)
+    multiprocessing.set_start_method('forkserver', force=True)
+
     main()
