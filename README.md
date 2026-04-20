@@ -60,6 +60,27 @@ If you prefer to have a local copy of this repository, you may also clone direct
 > [!WARNING]
 > Supported NVIDIA drivers version: >= 525 (Cuda 12/13 will be installed along the package, so there is no need to have CUDA already installed in your system).
 
+# Usage of the command line interface
+
+After installing the software, you will be able to launch the command `hax_project_manager`. This command allows to easily execute all the tools integrated inside `Hax` package.
+
+A detailed explanation on how to call the programs can be obtained by running:
+
+```bash
+
+  hax_project_manager -h
+
+```
+
+To see the help of any program, you may use:
+
+```bash
+
+  hax_project_manager program -h
+
+```
+
+Where `program` is the name of any method listed by the first help command (e.g. `hetsiren`)
 
 # References
 
