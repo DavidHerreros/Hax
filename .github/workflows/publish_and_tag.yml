@@ -9,10 +9,6 @@ name: master to pypi with comments and tag
 on:
   push:
     branches: [ main ]
-
-env:
-  WORKING_DIR: hax
-  PACKAGE_DIR: hax-em
   
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
@@ -26,15 +22,8 @@ jobs:
       id-token: write
       contents: write
 
-    defaults:
-      run:
-        working-directory: ${{ env.WORKING_DIR }}
-
     steps:
     - uses: actions/checkout@v2
-
-    - name: Set up MPI
-      uses: mpi4py/setup-mpi@v1
 
     - name: Set up Python
       uses: actions/setup-python@v3
@@ -53,7 +42,6 @@ jobs:
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
-        packages-dir: ${{ env.WORKING_DIR }}/dist/
         print-hash: true
 
     - name: Get version and tag
