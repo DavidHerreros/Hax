@@ -1145,15 +1145,15 @@ def main():
             if not os.path.isdir(os.path.join(fit_path)):
                 # Consensus volume
                 if args.num_gaussians is not None:
-                    model, _, _ = fit_volume(vol, mask=mask, iterations=20000, learning_rate=0.001,
+                    model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.001,
                                              n_init=args.num_gaussians, fixed_gaussians=True)
                 else:
-                    model, _, _ = fit_volume(vol, mask=mask, iterations=20000, learning_rate=0.01, grad_threshold=1e-5,
+                    model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.01, grad_threshold=1e-5,
                                              densify_interval=2000, n_init=2500)
 
                 # Adjust to images
                 model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                                    num_epochs=3, is_global=True, ctf_type=args.ctf_type)
+                                                    num_epochs=5, is_global=True, ctf_type=args.ctf_type)
 
                 # Save model
                 NeuralNetworkCheckpointer.save(model, fit_path)
