@@ -10,7 +10,7 @@
 
 <p align="center">
         
-<img alt="HAX" width="300" src="hax/viewers/annotate_space/media/logo.png">
+<img alt="HAX" width="300" src="https://github.com/DavidHerreros/hax-em/blob/main/hax/viewers/annotate_space/media/logo.png">
 
 </p>
 
@@ -43,10 +43,10 @@ We recommend installing the package directly from Pypi using the command:
 ```bash
   
   # Cuda 13 command
-  pip install hax[cuda13]
+  pip install hax-em[cuda13]
   
   # Cuda 12 command
-  pip install hax[cuda12]
+  pip install hax-em[cuda12]
 
 ```
 
